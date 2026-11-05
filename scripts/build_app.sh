@@ -15,7 +15,7 @@ BIN="$(cd "$APPDIR" && swift build -c "$CONFIG" --show-bin-path)/Yap"
 
 echo "[build] assembling $APP"
 [[ "$APP" == "$ROOT/dist/Yap.app" ]] || exit 1
-if [ -e "$APP" ]; then trash "$APP"; fi
+if [ -e "$APP" ]; then rm -rf "$APP"; fi
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/repo"
 
 cp "$BIN" "$APP/Contents/MacOS/Yap"
@@ -61,9 +61,7 @@ chmod +x "$APP/Contents/Resources/bin/yap"
 # Built by scripts/bundle_python.sh (cached). Without it, the app falls back to
 # building a venv from system Python (dev machines only).
 if [ "${PARLEY_BUNDLE_PYTHON:-1}" = "1" ]; then
-  if [ ! -x "$ROOT/dist/python-runtime/bin/python3" ]; then
-    bash "$ROOT/scripts/bundle_python.sh"
-  fi
+  bash "$ROOT/scripts/bundle_python.sh"
   echo "[build] embedding Python runtime"
   ditto "$ROOT/dist/python-runtime" "$APP/Contents/Resources/python"
 fi
@@ -97,9 +95,9 @@ if [ -f "$SIGN_KC" ] && security find-certificate -c "$SIGN_ID" "$SIGN_KC" >/dev
     echo "[build] ERROR: codesign with '$SIGN_ID' failed — grant will NOT persist:" >&2
     sed 's/^/[build]   /' "$CODESIGN_ERR" >&2
     echo "[build]        Re-run: bash scripts/setup_signing.sh   then rebuild." >&2
-    trash "$CODESIGN_ERR"; exit 1
+    rm -f "$CODESIGN_ERR"; exit 1
   fi
-  trash "$CODESIGN_ERR"
+  rm -f "$CODESIGN_ERR"
 else
   echo "[build] ad-hoc signing (no stable identity; run scripts/setup_signing.sh)"
   codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || echo "[build] codesign skipped"
