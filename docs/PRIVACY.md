@@ -24,8 +24,21 @@ it touches, and why — so you don't have to take "private" on faith.
 
 ## What goes over the network
 
-Every network call Yap makes is a download or the update check. None of them
-sends your audio, your text, or anything that identifies you.
+Yap uses different sources for downloads, not one exclusive host:
+FluidAudio dictation models and Pocket's public model catalog use
+`https://huggingface.co`; Kokoro voice assets come from GitHub Releases;
+optional CMU ARCTIC starter clips come from `festvox.org` (over HTTP with
+pinned SHA-256 verification); optional Python packages come from the configured
+package index, and the update check reaches the GitHub API. The optional
+voice-cloning weights use a separately configured Hugging Face mirror.
+
+Before any model load, Yap fixes **FluidAudio's registry** to the official
+Hugging Face host and removes inherited Hugging Face tokens and registry
+overrides from the app process and Python sidecar. It also disables implicit
+Hugging Face token use and Hugging Face telemetry. This does not constrain
+other download sources or replace their separate integrity checks. Yap's
+application logic does not intentionally upload dictated audio, transcripts,
+selected text, or clipboard contents.
 
 **At launch, without a click:**
 
@@ -105,6 +118,16 @@ and the only network use is downloading its models
 ([`Dictation.swift`](../app/Sources/Yap/Dictation.swift)). Don't dictate? Don't
 grant it. The read-aloud half works without it.
 
+## Full-text history (opt-in)
+
+Yap can keep up to 500 spoken and 500 dictated entries in
+`~/Library/Application Support/Yap/history.json`, including full text.
+**New entries are not saved by default.** Enable "Save full dictated and
+spoken text" under Settings ▸ History if you want transcript recovery.
+Existing history from older versions is **not automatically deleted**;
+clear spoken and dictated entries separately in Settings ▸ History.
+History is local plaintext JSON, not encrypted.
+
 ## The agent API (a local socket)
 
 Other programs on your Mac can ask Yap to speak, or to listen, through a Unix
@@ -122,8 +145,13 @@ switched off, which removes the socket.
 
 ## What Yap does NOT do
 
-- No keylogging. It reads a selection only when you press the shortcut — it does
-  not observe what you type.
+- No keylogging. Yap does not install a global key-down or character-input
+  monitor. Its only global event monitor watches modifier-state changes
+  (`flagsChanged`) for a modifier-only hotkey, and is installed only when you
+  choose that kind of shortcut. While you explicitly record a shortcut in
+  Settings, a local key-down monitor captures that one chord and removes itself
+  immediately after the recording or when Settings closes. It does not observe
+  ordinary typing in other apps.
 - No always-on listening. The mic records only during a dictation session,
   including the 0.6-second finishing window after you press stop. A program using
   the [agent API](AGENT-API.md) starts the same session, with the same HUD, and

@@ -85,6 +85,10 @@ final class HistoryStore: ObservableObject {
     func recordDictated(_ text: String, detail: String = "") { add(kind: .dictated, text: text, detail: detail) }
 
     private func add(kind: HistoryEntry.Kind, text: String, detail: String) {
+        // Test probes isolate their history file and must still validate recovery.
+        let isProbe = Self.probeFileURL != nil ||
+            ProcessInfo.processInfo.environment["YAP_HISTORY_FILE"] != nil
+        guard Prefs.shared.historyEnabled || isProbe else { return }
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
         let entry = HistoryEntry(kind: kind, text: t, detail: detail)
@@ -153,12 +157,28 @@ final class HistoryStore: ObservableObject {
         // or an early save would truncate the file to just the in-window entries.
         guard loaded else { pendingSave = true; return }
         let spokenCopy = spoken, dictatedCopy = dictated, url = fileURL
+        let isDefaultStorage = url.standardizedFileURL == Self.defaultURL.standardizedFileURL
         io.async {
             guard let data = try? JSONEncoder().encode(
                 Snapshot(spoken: spokenCopy, dictated: dictatedCopy)) else { return }
-            try? FileManager.default.createDirectory(
-                at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try? data.write(to: url, options: .atomic)
+            let fm = FileManager.default
+            let parent = url.deletingLastPathComponent()
+            do {
+                // A new default Yap data directory must not be traversable by
+                // other local users. Do not change permissions on test/override paths.
+                try fm.createDirectory(at: parent, withIntermediateDirectories: true,
+                    attributes: isDefaultStorage ? [.posixPermissions: 0o700] : nil)
+                if isDefaultStorage {
+                    try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: parent.path)
+                }
+                try data.write(to: url, options: .atomic)
+                // Also protect the new inode after an atomic replacement.
+                if isDefaultStorage {
+                    try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+                }
+            } catch {
+                Log.write("history: could not persist private history: \(error.localizedDescription)")
+            }
         }
     }
 }
