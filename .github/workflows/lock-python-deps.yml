@@ -1,0 +1,98 @@
+name: Python dependency lock validation
+
+# Validate the committed dependency locks on the exact Apple Silicon / CPython
+# target used by Yap. This workflow is read-only: dependency updates are reviewed
+# as source changes and the generated lockfiles are committed with the PR.
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/lock-python-deps.yml"
+      - "backend/requirements.in"
+      - "backend/requirements-pocket.in"
+      - "backend/requirements.txt"
+      - "backend/requirements-pocket.txt"
+      - "backend/server.py"
+      - "backend/download_models.py"
+      - "backend/tests/test_install_security.py"
+      - "backend/tests/test_download_models.py"
+      - "scripts/bundle_python.sh"
+      - "scripts/build_app.sh"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: yap-python-lock-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify hash-locked Python environments (macOS arm64)
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Download exact pinned CPython runtime and install resolver
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "arm64"
+          url="https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.12.16%2B20261026-aarch64-apple-darwin-install_only.tar.gz"
+          expected="fbf4afef53c2a6b72bb741bc06d5671a9dfaf87bd84e5aa73ac9b3d0d589f14e"
+          tmp="$(mktemp -d)"
+          curl --fail --location --silent --show-error --retry 3 --output "$tmp/python.tar.gz" "$url"
+          echo "$expected  $tmp/python.tar.gz" | shasum -a 256 -c -
+          mkdir -p "$tmp/extract"
+          tar -xzf "$tmp/python.tar.gz" -C "$tmp/extract"
+          test -x "$tmp/extract/python/bin/python3"
+          mv "$tmp/extract/python" "$RUNNER_TEMP/yap-python"
+          echo "YAP_PYTHON=$RUNNER_TEMP/yap-python/bin/python3" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/yap-python/bin/python3" --version
+          "$RUNNER_TEMP/yap-python/bin/python3" -I -m pip install --isolated \
+            --disable-pip-version-check pip-tools==7.6.2
+
+      - name: Verify committed locks match their input requirements
+        env:
+          PIP_CONFIG_FILE: /dev/null
+          PIP_INDEX_URL: https://pypi.org/simple
+        run: |
+          cp backend/requirements.txt "$RUNNER_TEMP/requirements.before"
+          cp backend/requirements-pocket.txt "$RUNNER_TEMP/requirements-pocket.before"
+          "$RUNNER_TEMP/yap-python/bin/pip-compile" --generate-hashes --allow-unsafe \
+            --resolver=backtracking --strip-extras --no-emit-index-url \
+            --pip-args="--only-binary=:all:" \
+            --output-file=backend/requirements.txt backend/requirements.in
+          "$RUNNER_TEMP/yap-python/bin/pip-compile" --generate-hashes --allow-unsafe \
+            --resolver=backtracking --strip-extras --no-emit-index-url \
+            --pip-args="--only-binary=:all:" \
+            --output-file=backend/requirements-pocket.txt backend/requirements-pocket.in
+          cmp backend/requirements.txt "$RUNNER_TEMP/requirements.before"
+          cmp backend/requirements-pocket.txt "$RUNNER_TEMP/requirements-pocket.before"
+
+      - name: Install and import-check the default runtime from hashes
+        run: |
+          "$YAP_PYTHON" -m venv "$RUNNER_TEMP/yap-default"
+          "$RUNNER_TEMP/yap-default/bin/python" -m pip install --isolated \
+            --disable-pip-version-check --require-hashes --only-binary=:all: \
+            --no-cache-dir -r backend/requirements.txt
+          "$RUNNER_TEMP/yap-default/bin/python" -I -c \
+            "import kokoro_onnx, onnxruntime, fastapi, soundfile; print('default runtime imports OK')"
+
+      - name: Test Pocket installer security contract
+        run: |
+          "$RUNNER_TEMP/yap-default/bin/python" -m pip install --isolated \
+            --disable-pip-version-check pytest==9.0.2
+          cd backend
+          "$RUNNER_TEMP/yap-default/bin/python" -m pytest \
+            tests/test_install_security.py tests/test_download_models.py -v
+
+      - name: Install and import-check the optional Pocket runtime from hashes
+        run: |
+          mkdir -p "$RUNNER_TEMP/yap-pocket"
+          "$YAP_PYTHON" -m pip install --isolated --disable-pip-version-check \
+            --require-hashes --only-binary=:all: --no-cache-dir \
+            --target "$RUNNER_TEMP/yap-pocket" \
+            -r backend/requirements-pocket.txt
+          PYTHONPATH="$RUNNER_TEMP/yap-pocket" "$YAP_PYTHON" -c \
+            "import torch, pocket_tts, kokoro_onnx, onnxruntime; print('Pocket runtime imports OK', torch.__version__)"
