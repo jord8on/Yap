@@ -28,8 +28,8 @@ with socket.socket() as sock:
     print(sock.getsockname()[1])
 PY
 )"
-YAP_AUTH_TOKEN_FILE="$TOKEN" YAP_MODELS_DIR="$DIR/models" \
-    "$PY" -I "$SERVER" --no-preload --port "$PORT" \
+PYTHONNOUSERSITE=1 PYTHONPATH="" YAP_AUTH_TOKEN_FILE="$TOKEN" YAP_MODELS_DIR="$DIR/models" \
+    "$PY" "$SERVER" --no-preload --port "$PORT" \
     --models-dir "$DIR/models" >"$OUT/packaged-backend.log" 2>&1 &
 PID=$!
 cleanup() {
