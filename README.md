@@ -20,7 +20,7 @@ https://github.com/user-attachments/assets/8fae0d41-6e23-4b7c-8de5-03618614a30b
 brew install --cask latent-variable/tap/yap
 ```
 
-Or grab `Yap-*.dmg` from [Releases](https://github.com/latent-variable/Yap/releases), drag it to Applications, and run `xattr -cr /Applications/Yap.app` once (it's open source, not notarized). Or build it: `git clone https://github.com/latent-variable/Yap.git && cd Yap && bash scripts/build_app.sh && open dist/Yap.app`.
+Or grab `Yap-*.dmg` from [Releases](https://github.com/latent-variable/Yap/releases). **Current public builds are not notarized. Do not run `xattr -cr` or otherwise remove Gatekeeper quarantine to force them open.** For local testing, build from source on your own Mac; friction-free downloaded distribution requires a Developer ID–signed and notarized release.
 
 First launch: Yap downloads the Kokoro voice (~340 MB) on its own; grant Microphone and Accessibility when asked. The app bundles its own Python, so there is nothing else to install.
 
@@ -36,7 +36,7 @@ First launch: Yap downloads the Kokoro voice (~340 MB) on its own; grant Microph
 
 Both shortcuts can be any chord, including a modifier-only one like ⌥⌘ held and released.
 
-- **Dictation** runs NVIDIA Parakeet on the Apple Neural Engine: a fast streaming model for the live preview, an accurate one for the text it inserts. English, or 25 languages in multilingual mode. Your last 500 dictations are kept in Settings ▸ History, so a missed paste can be copied again.
+- **Dictation** runs NVIDIA Parakeet on the Apple Neural Engine: a fast streaming model for the live preview, an accurate one for the text it inserts. English, or 25 languages in multilingual mode. If you opt in under Settings ▸ History, your last 500 dictations are kept locally so a missed paste can be copied again. Full-text history is off by default.
 - **Two voice engines.** Kokoro: 54 voices in 8 languages, instant, on CPU. Pocket TTS (optional): 26 more natural voices, and **voice cloning** from a 20-second clip.
 - **Cleanup before it speaks.** Markdown, code blocks, citations and URLs are stripped so you hear the words, not the punctuation.
 
