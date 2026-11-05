@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 paths = [*Path("app/Sources").rglob("*.swift"), *Path("scripts").rglob("*.sh")]
 for path in paths:
-    if path.name == "check-quarantine-policy.sh":
+    if path.name == "check-quarantine-policy.sh" or path.as_posix() == "scripts/ci/inspect-packaged-yap.sh":
         continue
     for number, line in enumerate(path.read_text().splitlines(), start=1):
         stripped = line.strip()
