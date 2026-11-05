@@ -46,6 +46,8 @@ jobs:
 
       - name: Gatekeeper quarantine policy
         run: bash scripts/check-quarantine-policy.sh
+      - name: Input-event monitoring policy
+        run: bash scripts/check-input-monitor-policy.sh
       - name: Dependencies (OSV-Scanner)
         run: bash scripts/audit-deps.sh
       - name: Code and secrets (Semgrep, gitleaks)
