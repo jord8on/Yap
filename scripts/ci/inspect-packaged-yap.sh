@@ -39,6 +39,30 @@ print('Bundled imports passed', sys.version)
 PY
 pass "Packaged relocatable CPython imports TTS dependencies."
 
+# Exercise the actual packaged app executable, not only a SwiftPM test binary.
+# This is a synthetic, isolated self-test without model downloads or user data.
+if python3 - "$APP/Contents/MacOS/Yap" "$OUT" <<'PY'
+import os, pathlib, subprocess, sys
+exe, out = sys.argv[1:]
+home = pathlib.Path(out) / "sandbox-home"
+home.mkdir(parents=True, exist_ok=True)
+env = os.environ.copy()
+env["HOME"] = str(home)
+env["YAP_HISTORY_FILE"] = str(home / "history-probe.json")
+with open(pathlib.Path(out) / "packaged-selftest.log", "w") as log:
+    try:
+        result = subprocess.run([exe, "--selftest"], env=env, stdout=log,
+                                stderr=subprocess.STDOUT, timeout=100)
+    except subprocess.TimeoutExpired:
+        sys.exit(124)
+    sys.exit(result.returncode)
+PY
+then
+  pass "Actual packaged Yap executable completed its built-in self-test."
+else
+  fix "Packaged Yap --selftest failed or timed out; see packaged-selftest.log."
+fi
+
 if codesign --verify --deep --strict --verbose=2 "$APP" > "$OUT/app-codesign.log" 2>&1; then
   pass "Built app passes codesign --verify --deep --strict."
 else
@@ -99,3 +123,9 @@ pending "Long-running stability, sleep/wake, multi-instance UI use and real spee
 echo >> "$REPORT"
 echo 'This build is for security evaluation only. Do not install on a primary Mac or publish as a release.' >> "$REPORT"
 cat "$REPORT"
+# An audit receipt containing NEEDS FIXING is a failed CI validation,
+# even if construction and other independent checks succeeded.
+if grep -q '^NEEDS FIXING:' "$OUT/results.log"; then
+  echo 'Packaged security inspection detected a blocking failure.' >&2
+  exit 1
+fi
