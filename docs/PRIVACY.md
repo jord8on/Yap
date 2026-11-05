@@ -24,8 +24,21 @@ it touches, and why — so you don't have to take "private" on faith.
 
 ## What goes over the network
 
-Every network call Yap makes is a download or the update check. None of them
-sends your audio, your text, or anything that identifies you.
+Yap uses different sources for downloads, not one exclusive host:
+FluidAudio dictation models and Pocket's public model catalog use
+`https://huggingface.co`; Kokoro voice assets come from GitHub Releases;
+optional CMU ARCTIC starter clips come from `festvox.org` (over HTTP with
+pinned SHA-256 verification); optional Python packages come from the configured
+package index, and the update check reaches the GitHub API. The optional
+voice-cloning weights use a separately configured Hugging Face mirror.
+
+Before any model load, Yap fixes **FluidAudio's registry** to the official
+Hugging Face host and removes inherited Hugging Face tokens and registry
+overrides from the app process and Python sidecar. It also disables implicit
+Hugging Face token use and Hugging Face telemetry. This does not constrain
+other download sources or replace their separate integrity checks. Yap's
+application logic does not intentionally upload dictated audio, transcripts,
+selected text, or clipboard contents.
 
 **At launch, without a click:**
 
