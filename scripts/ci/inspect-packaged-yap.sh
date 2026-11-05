@@ -24,6 +24,14 @@ test -x "$APP/Contents/MacOS/Yap" || { echo 'Missing Yap executable'; exit 1; }
 test -x "$APP/Contents/Resources/python/bin/python3" || { echo 'Missing bundled CPython'; exit 1; }
 pass "Full Yap.app, embedded CPython and DMG were created."
 
+# Check the seal before any imports or runtime tests. A post-test failure
+# means the test or app changed the signed bundle, not the signing step.
+if codesign --verify --deep --strict --verbose=2 "$APP" > "$OUT/codesign-before-run.log" 2>&1; then
+  pass "Signed app resource seal is valid before runtime execution."
+else
+  fix "App signature was already invalid before runtime execution."
+fi
+
 for name in requirements.txt requirements-pocket.txt; do
   file="$APP/Contents/Resources/repo/backend/$name"
   if test -s "$file" && grep -q -- '--hash=sha256:' "$file"; then
@@ -32,7 +40,7 @@ for name in requirements.txt requirements-pocket.txt; do
     fix "Packaged backend missing hash-locked $name."
   fi
 done
-"$APP/Contents/Resources/python/bin/python3" -I - <<'PY'
+"$APP/Contents/Resources/python/bin/python3" -I -B - <<'PY'
 import fastapi, kokoro_onnx, onnxruntime, soundfile, sys
 assert sys.version_info[:2] == (3, 12), sys.version
 print('Bundled imports passed', sys.version)
@@ -48,6 +56,7 @@ home = pathlib.Path(out) / "sandbox-home"
 home.mkdir(parents=True, exist_ok=True)
 env = os.environ.copy()
 env["HOME"] = str(home)
+env["PYTHONDONTWRITEBYTECODE"] = "1"
 env["YAP_HISTORY_FILE"] = str(home / "history-probe.json")
 with open(pathlib.Path(out) / "packaged-selftest.log", "w") as log:
     try:

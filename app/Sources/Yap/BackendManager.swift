@@ -174,6 +174,8 @@ final class BackendManager: NSObject, ObservableObject {
         guard process == nil else { return }
         let p = Process()
         var env = ProcessInfo.processInfo.environment
+        // Python imports must not write __pycache__ into the sealed .app.
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["YAP_MODELS_DIR"] = modelsDir.path
         env["YAP_PORT"] = String(port)
         env["YAP_PROVIDER"] = Prefs.shared.providerMode
@@ -190,7 +192,7 @@ final class BackendManager: NSObject, ObservableObject {
             // Preferred: run the bundled runtime directly — no system Python.
             let server = root.appending(path: "backend/server.py")
             p.executableURL = py
-            p.arguments = [server.path, "--port", String(port),
+            p.arguments = ["-B", server.path, "--port", String(port),
                            "--models-dir", modelsDir.path, "--provider", Prefs.shared.providerMode]
             // Drop inherited vars that would pull in the user's Python so the
             // relocatable runtime self-locates — THEN set PYTHONPATH to just
