@@ -34,17 +34,17 @@ fi
 echo "[dmg] staging"
 [[ "$STAGE" == "$ROOT/dist/dmg-stage" && "$DMG" == "$ROOT/dist/Yap-$VERSION.dmg" ]] || exit 1
 for artifact in "$STAGE" "$DMG"; do
-  if [ -e "$artifact" ]; then trash "$artifact"; fi
+  if [ -e "$artifact" ]; then rm -rf "$artifact"; fi
 done
 mkdir -p "$STAGE"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
-# strip quarantine so right-click-Open friction is minimal locally
-xattr -cr "$STAGE/Yap.app" 2>/dev/null || true
+# Preserve all extended attributes. A packaging script must never bypass
+# Gatekeeper by removing quarantine from an app or its nested executables.
 
 echo "[dmg] creating compressed image"
 hdiutil create -volname "$VOL" -srcfolder "$STAGE" -ov -format UDZO -fs HFS+ "$DMG" >/dev/null
-trash "$STAGE"
+rm -rf "$STAGE"
 
 SIZE="$(du -h "$DMG" | cut -f1)"
 echo "[dmg] done -> $DMG ($SIZE)"
