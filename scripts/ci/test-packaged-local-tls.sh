@@ -2,6 +2,7 @@
 # HTTPS smoke test against the exact Python sidecar embedded in the packaged
 # .app. Runs with a private throwaway token/model directory. CI can opt into
 # downloading hash-pinned public Kokoro models and synthesizing test text.
+# The sidecar itself must work with outbound network connections denied.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 APP="$ROOT/dist/Yap.app"
@@ -10,9 +11,83 @@ SERVER="$APP/Contents/Resources/repo/backend/server.py"
 OUT="$ROOT/dist/security-audit"
 mkdir -p "$OUT"
 test -x "$PY" && test -f "$SERVER"
+[[ "$(uname -s)" == Darwin && -x /usr/bin/sandbox-exec ]] || {
+  echo "macOS sandbox-exec is required for the packaged backend network check" >&2
+  exit 2
+}
 
 DIR="$(mktemp -d)"
 chmod 700 "$DIR"
+PID=""
+cleanup() {
+  if [ -n "$PID" ]; then
+    kill "$PID" >/dev/null 2>&1 || true
+    wait "$PID" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$DIR"
+}
+trap cleanup EXIT
+
+# Deny connection initiation by the backend while retaining inbound loopback
+# HTTPS. Model assets are downloaded separately, never by the sandboxed sidecar.
+YAP_TLS_NETWORK_PROFILE="$DIR/backend-network.sb"
+cat > "$YAP_TLS_NETWORK_PROFILE" <<'SANDBOX'
+(version 1)
+(allow default)
+(deny network-outbound)
+SANDBOX
+cp "$YAP_TLS_NETWORK_PROFILE" "$OUT/packaged-backend-network.sb"
+
+# A timeout or an unreachable route is NOT evidence that the sandbox denied a
+# connection. The same embedded Python and profile must produce EPERM/EACCES.
+# 192.0.2.1 is a documentation address; no DNS lookup or user data is involved.
+python3 - "$PY" "$YAP_TLS_NETWORK_PROFILE" "$OUT" <<'PY'
+from pathlib import Path
+import errno, hashlib, json, os, subprocess, sys
+
+embedded_python, profile, output = sys.argv[1:]
+probe = r'''
+import errno, json, socket
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
+    connection.settimeout(2)
+    try:
+        connection.connect(("192.0.2.1", 9))
+    except PermissionError as error:
+        if error.errno not in (errno.EPERM, errno.EACCES):
+            raise
+        print(json.dumps({"result": "denied", "error_type": type(error).__name__,
+                          "errno": error.errno, "target": "192.0.2.1:9"}))
+    else:
+        raise SystemExit("FAIL: outbound connection was unexpectedly permitted")
+'''
+environment = os.environ.copy()
+environment.update({"PYTHONNOUSERSITE": "1", "PYTHONPATH": ""})
+command = ["/usr/bin/sandbox-exec", "-f", profile, embedded_python, "-B", "-c", probe]
+log = Path(output, "packaged-network-canary.log")
+try:
+    result = subprocess.run(command, env=environment, capture_output=True,
+                            text=True, timeout=15)
+except subprocess.TimeoutExpired:
+    log.write_text("FAIL: outbound-denial canary exceeded its 15-second limit\n")
+    raise SystemExit(log.read_text())
+log.write_text(result.stdout + result.stderr)
+if result.returncode != 0:
+    raise SystemExit("FAIL: outbound-denial canary did not report PermissionError\n" + log.read_text())
+canary = json.loads(result.stdout)
+assert canary["result"] == "denied" and canary["error_type"] == "PermissionError", canary
+assert canary["errno"] in (errno.EPERM, errno.EACCES), canary
+receipt = {
+    "scope": "packaged Python sidecar; not a full-app packet trace",
+    "profile_sha256": hashlib.sha256(Path(profile).read_bytes()).hexdigest(),
+    "embedded_python_sha256": hashlib.sha256(Path(embedded_python).read_bytes()).hexdigest(),
+    "canary": canary,
+    "backend_https_checks": "not-completed",
+    "kokoro_synthesis": "not-completed",
+}
+Path(output, "packaged-network-denial.json").write_text(json.dumps(receipt, indent=2) + "\n")
+print("PASS: same-profile outbound canary received PermissionError errno=" + str(canary["errno"]))
+PY
+
 TOKEN="$DIR/auth-token"
 # Never print credentials to Actions logs or to artifacts.
 python3 - "$TOKEN" <<'PY'
@@ -30,15 +105,10 @@ with socket.socket() as sock:
 PY
 )"
 PYTHONNOUSERSITE=1 PYTHONPATH="" YAP_AUTH_TOKEN_FILE="$TOKEN" YAP_MODELS_DIR="$DIR/models" \
+    /usr/bin/sandbox-exec -f "$YAP_TLS_NETWORK_PROFILE" \
     "$PY" -B "$SERVER" --no-preload --port "$PORT" \
     --models-dir "$DIR/models" >"$OUT/packaged-backend.log" 2>&1 &
 PID=$!
-cleanup() {
-  kill "$PID" >/dev/null 2>&1 || true
-  wait "$PID" >/dev/null 2>&1 || true
-  rm -rf "$DIR"
-}
-trap cleanup EXIT
 
 CERT="$DIR/backend-tls-cert.pem"
 URL="https://127.0.0.1:$PORT"
@@ -117,6 +187,8 @@ PY
 # Exercise a real model through the packaged server, not a mock response. All
 # input is synthetic and sent only to the pinned loopback TLS listener. Model
 # downloads are public assets verified by the bundled downloader's SHA-256s.
+# Only this separate downloader can use outbound networking; synthesis remains
+# in the sidecar launched above with network-outbound denied.
 if [ "${YAP_PACKAGE_TEST_SYNTHESIS:-0}" = 1 ]; then
   "$PY" -B "$APP/Contents/Resources/repo/backend/download_models.py" \
     --models-dir "$DIR/models" > "$OUT/packaged-model-download.log" 2>&1
@@ -176,4 +248,14 @@ for p in (d, d / "backend-tls-cert.pem", d / "backend-tls-key.pem", d / "auth-to
     assert not (p.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO)), p.name
 PY
 
-printf 'PASS: actual packaged backend serves authenticated HTTPS, HMAC challenge, 401 for bad tokens, and rejects plaintext HTTP\n'
+python3 - "$OUT/packaged-network-denial.json" "${YAP_PACKAGE_TEST_SYNTHESIS:-0}" <<'PY'
+from pathlib import Path
+import json, sys
+receipt_path = Path(sys.argv[1])
+receipt = json.loads(receipt_path.read_text())
+receipt["backend_https_checks"] = "passed-with-outbound-denied"
+receipt["kokoro_synthesis"] = "passed-with-outbound-denied" if sys.argv[2] == "1" else "not-requested"
+receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
+PY
+
+printf 'PASS: actual packaged backend serves authenticated HTTPS, HMAC challenge, 401 for bad tokens, and rejects plaintext HTTP with outbound networking denied\n'
