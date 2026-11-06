@@ -239,7 +239,7 @@ Covered by `TestStreamIntegrity` (live uvicorn, raw socket, plus a control that 
 
 Something already answering is not automatically reused. `start()` decides:
 
-- **Unverified** (`verifyAuthentic()` fails — it can't prove it knows the shared secret). An identifiable Yap orphan (a `server.py` reparented to launchd, ppid 1) is almost always a stale pre-auth backend left over from an upgrade, so it's killed and a fresh authenticated one launched. Anything else is a foreign listener squatting the port: refused with an error, never handed captured text.
+- **Unverified** (TLS pinning or the HMAC proof fails). An occupied port is refused with an error; no bearer token or captured text is sent. The app does not kill or adopt that listener based on its process name. The user must stop an obsolete or foreign listener before retrying.
 - **Verified and ready** — reused.
 - **Verified but not ready** (responding, no model it can serve). If it's an adopted orphan, it's stopped and relaunched; if it's external, it's left alone and `start()` bails rather than racing a second process onto the same port.
 

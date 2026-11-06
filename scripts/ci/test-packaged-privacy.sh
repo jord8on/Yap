@@ -16,7 +16,9 @@ mkdir -p "$YAP_PRIVACY_RECEIPTS"
 YAP_PRIVACY_WORK="$(mktemp -d /private/tmp/yap-privacy.XXXXXXXX)"
 YAP_PRIVACY_ID="dev.yap.privacyprobe.$(uuidgen | tr '[:upper:]' '[:lower:]')"
 YAP_PRIVACY_COPY="$YAP_PRIVACY_WORK/YapPrivacyProbe.app"
-mkdir "$YAP_PRIVACY_WORK/home"
+# Make the complete expected support path exist before Foundation normalizes it;
+# existing /private/tmp aliases can otherwise differ from nonexistent descendants.
+mkdir -p "$YAP_PRIVACY_WORK/home/Library/Application Support"
 printf '%s' "$YAP_PRIVACY_ID" > "$YAP_PRIVACY_WORK/probe-id"
 # Preserve attributes, including quarantine. Only the copied bundle's identity
 # and local signature change; the source bundle remains untouched.

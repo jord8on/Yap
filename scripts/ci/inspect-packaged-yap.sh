@@ -58,14 +58,16 @@ shasum -a 256 "$ROOT/backend/requirements.txt" "$ROOT/backend/requirements-pocke
 pass "Installed Python package inventory, Swift revisions and dependency hashes were recorded."
 
 # Exercise the actual packaged app executable, not only a SwiftPM test binary.
-# This is a synthetic, isolated self-test without model downloads or user data.
+# Run only on the disposable CI account: redirecting the filesystem home alone
+# does not isolate the app's UserDefaults domain on a user's regular account.
+# The separate privacy wrapper provides a unique bundle identity for local tests.
 if python3 - "$APP/Contents/MacOS/Yap" "$OUT" <<'PY'
 import os, pathlib, subprocess, sys
 exe, out = sys.argv[1:]
 home = pathlib.Path(out) / "sandbox-home"
 home.mkdir(parents=True, exist_ok=True)
 env = os.environ.copy()
-env["HOME"] = str(home)
+env["CFFIXED_USER_HOME"] = str(home)
 env["PYTHONDONTWRITEBYTECODE"] = "1"
 env["YAP_HISTORY_FILE"] = str(home / "history-probe.json")
 with open(pathlib.Path(out) / "packaged-selftest.log", "w") as log:
@@ -137,7 +139,7 @@ pending "Developer ID signature and notarization: unavailable with free Apple ac
 pending "Interactive microphone, Accessibility, clipboard permission UX: headless CI cannot grant or verify user consent."
 pending "Dynamic egress/packet trace and negative exfiltration tests over full dictation/model-download flows."
 pending "Native binary audit, malicious-behavior certification and provenance attestation for every vendored wheel."
-pending "Long-running stability, sleep/wake, multi-instance UI use and real speech model operation."
+pending "Long-running stability, sleep/wake, multi-instance UI use, microphone capture and optional model engines. Kokoro synthesis is covered by the separate HTTPS smoke receipt."
 
 echo >> "$REPORT"
 echo 'This build is for security evaluation only. Do not install on a primary Mac or publish as a release.' >> "$REPORT"

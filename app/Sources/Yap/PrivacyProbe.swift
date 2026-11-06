@@ -69,13 +69,30 @@ enum PrivacyProbe {
             let root = URL(fileURLWithPath: rootPath).resolvingSymlinksInPath().standardizedFileURL
             let home = URL(fileURLWithPath: homePath).resolvingSymlinksInPath().standardizedFileURL
             let bundle = Bundle.main.bundleURL.resolvingSymlinksInPath().standardizedFileURL
-            guard root.path.hasPrefix("/private/tmp/yap-privacy."),
-                  home.path == root.appending(path: "home").path,
-                  bundle.path == root.appending(path: "YapPrivacyProbe.app").path,
-                  let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first,
-                  support.resolvingSymlinksInPath().standardizedFileURL.path.hasPrefix(home.path + "/"),
-                  (try? String(contentsOf: root.appending(path: "probe-id"), encoding: .utf8)) == bundleID else {
-                throw ProbeError.refused("test bundle, marker, and Application Support must resolve inside the private probe directory")
+            // Foundation may normalize an existing /private/tmp path to /tmp.
+            // Normalize both sides instead of requiring one spelling of the same
+            // directory. Keep exact parent/name and containment checks intact.
+            let temporaryParent = URL(fileURLWithPath: "/private/tmp").resolvingSymlinksInPath().standardizedFileURL
+            guard root.deletingLastPathComponent().path == temporaryParent.path,
+                  root.lastPathComponent.hasPrefix("yap-privacy.") else {
+                throw ProbeError.refused("unexpected probe root: \(root.path); expected a yap-privacy directory directly inside \(temporaryParent.path)")
+            }
+            guard home.path == root.appending(path: "home").path else {
+                throw ProbeError.refused("isolated home escaped the probe root: \(home.path)")
+            }
+            guard bundle.path == root.appending(path: "YapPrivacyProbe.app").path else {
+                throw ProbeError.refused("running bundle is not the isolated probe copy: \(bundle.path)")
+            }
+            guard let supportURL = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+                throw ProbeError.refused("Foundation did not resolve Application Support")
+            }
+            let support = supportURL.resolvingSymlinksInPath().standardizedFileURL
+            let expectedSupport = home.appending(path: "Library/Application Support").resolvingSymlinksInPath().standardizedFileURL
+            guard support.path == expectedSupport.path else {
+                throw ProbeError.refused("Application Support resolved to \(support.path); expected \(expectedSupport.path)")
+            }
+            guard (try? String(contentsOf: root.appending(path: "probe-id"), encoding: .utf8)) == bundleID else {
+                throw ProbeError.refused("the private probe marker does not match its unique bundle identifier")
             }
             var st = stat()
             guard lstat(root.path, &st) == 0, st.st_uid == getuid(),
