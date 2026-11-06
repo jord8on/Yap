@@ -1,7 +1,7 @@
 # Architecture
 
 Voice runs across two local processes: a native SwiftUI menu-bar app talks to a
-Python TTS sidecar over loopback HTTP. Ears stay in the app: AVAudioEngine
+Python TTS sidecar over certificate-pinned loopback HTTPS. Ears stay in the app: AVAudioEngine
 captures the microphone and FluidAudio runs local streaming and batch ASR. The
 sidecar hosts two interchangeable engines (Kokoro default, Pocket TTS opt-in)
 behind one int16-PCM contract.
@@ -20,7 +20,7 @@ behind one int16-PCM contract.
 | Refused-read notice next to the pointer (shows with sounds muted, never takes focus) | `Notice.swift` |
 | Accessibility permission | `Permissions.swift` |
 | Preprocessing / cleanup | `Preprocess.swift` |
-| Backend HTTP client | `BackendClient.swift` |
+| Backend HTTPS client with per-connection certificate pinning | `BackendClient.swift` |
 | Backend process supervisor | `BackendManager.swift` |
 | Streaming audio engine (pre-buffer, live speed) | `AudioPlayer.swift` |
 | Reference-clip import (→ mono 24k WAV) | `AudioImport.swift` |
@@ -37,6 +37,7 @@ behind one int16-PCM contract.
 | Settings ▸ Agents: the copy-ready "Speak to me" instructions for coding agents | `Views/AgentsTab.swift` |
 | UI screenshots of the menu and every Settings pane, light and dark (`--uishot <dir>`, sample history, never the user's) | `UIShotProbe.swift` |
 | Logic self-test / pipe probe | `Selftest.swift`, `CLITest.swift` |
+| Packaged privacy probe (`--privacytest`, disposable bundle/defaults identity, no microphone capture) | `PrivacyProbe.swift` + `scripts/ci/test-packaged-privacy.sh` |
 | **Dictation (ears)** | |
 | Microphone capture, streaming ASR, accurate batch transcription + rolling preview | `Dictation.swift` |
 | Dictation hotkey, floating HUD, transcript stitching + orchestration | `DictationController.swift` |

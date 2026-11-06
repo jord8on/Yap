@@ -47,6 +47,16 @@ print('Bundled imports passed', sys.version)
 PY
 pass "Packaged relocatable CPython imports TTS dependencies."
 
+# Record the actual installed packages and exact Swift revisions in the audit
+# artifact. This is an inventory, not a provenance attestation.
+"$APP/Contents/Resources/python/bin/python3" -I -B -m pip inspect --local \
+  > "$OUT/python-package-inventory.json"
+cp "$ROOT/app/Package.resolved" "$OUT/swift-package-resolved.json"
+cp "$APP/Contents/Resources/python/.yap-runtime-source" "$OUT/python-runtime-source.txt"
+shasum -a 256 "$ROOT/backend/requirements.txt" "$ROOT/backend/requirements-pocket.txt" \
+  "$ROOT/app/Package.resolved" > "$OUT/dependency-lock-hashes.txt"
+pass "Installed Python package inventory, Swift revisions and dependency hashes were recorded."
+
 # Exercise the actual packaged app executable, not only a SwiftPM test binary.
 # This is a synthetic, isolated self-test without model downloads or user data.
 if python3 - "$APP/Contents/MacOS/Yap" "$OUT" <<'PY'

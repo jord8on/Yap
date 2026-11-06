@@ -53,8 +53,10 @@ process *already running as that same macOS user* may read the file; no HMAC
 challenge can prevent that. Using a per-user Unix-domain socket with verified
 peer credentials or a process-bound channel could improve local process
 authentication, but is not the same as isolating applications inside one
-macOS user account. Per-request preflight still has a short challenge-to-request
-race window.
+macOS user account. The hardened client pins the private per-user TLS identity
+on the connection carrying each authenticated request, removing the separate
+preflight-to-request listener substitution window. A same-user process that
+can read both the token and TLS private key remains outside that protection.
 
 **Release rule:** Do not consider a patched but unsigned, untested source build
 ready for a sensitive primary Mac. Keep changes in draft review until the

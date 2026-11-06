@@ -16,6 +16,9 @@ enum YapMain {
         // a model download. Never inherit a caller's HF token or registry URL.
         ModelNetworkPolicy.apply()
 
+        if CommandLine.arguments.contains("--privacytest") {
+            PrivacyProbe.run()
+        }
         if let i = CommandLine.arguments.firstIndex(of: "--pipetest") {
             let path = CommandLine.arguments.count > i + 1 ? CommandLine.arguments[i + 1] : ""
             let prof = CommandLine.arguments.count > i + 2 ? CommandLine.arguments[i + 2] : nil

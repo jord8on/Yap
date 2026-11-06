@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # HTTPS smoke test against the exact Python sidecar embedded in the packaged
-# .app. Runs under an isolated throwaway home/token; no speech model downloads.
+# .app. Runs with a private throwaway token/model directory. CI can opt into
+# downloading hash-pinned public Kokoro models and synthesizing test text.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 APP="$ROOT/dist/Yap.app"
@@ -79,11 +80,90 @@ wrong_code="$(curl --silent --max-time 5 --cacert "$CERT" \
   -o /dev/null -w '%{http_code}' "$URL/health")"
 [ "$wrong_code" = 401 ] || { echo "Wrong-token health returned $wrong_code"; exit 1; }
 
-# Cleartext HTTP on the protected port must not return a usable health reply.
-if curl --silent --fail --max-time 2 "http://127.0.0.1:$PORT/health" \
-      -o "$DIR/http-response.json"; then
-  echo "Unsafe cleartext HTTP received a successful response" >&2
+# The TLS listener must reject the protocol itself, even for unauthenticated
+# requests. Merely using curl --fail would also accept a cleartext HTTP 401.
+http_code="$(curl --silent --max-time 2 "http://127.0.0.1:$PORT/health" \
+      -o "$DIR/http-response.json" -w '%{http_code}' || true)"
+if [ "$http_code" != 000 ]; then
+  echo "Unsafe cleartext HTTP received status $http_code" >&2
   exit 1
+fi
+
+# Parallel real TLS connections must all authenticate to the same per-user
+# identity. Reuse neither an insecure context nor curl's connection cache.
+python3 - "$CERT" "$TOKEN" "$URL" <<'PY'
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import json, ssl, sys, urllib.error, urllib.request
+cert, token_path, base = sys.argv[1:]
+token = Path(token_path).read_text()
+def health(_):
+    context = ssl.create_default_context(cafile=cert)
+    request = urllib.request.Request(base + "/health", headers={"Authorization": "Bearer " + token})
+    with urllib.request.urlopen(request, context=context, timeout=10) as response:
+        assert response.status == 200
+        assert isinstance(json.load(response), dict)
+with ThreadPoolExecutor(max_workers=8) as pool:
+    list(pool.map(health, range(24)))
+try:
+    urllib.request.urlopen(base + "/health", context=ssl.create_default_context(), timeout=5)
+except urllib.error.URLError as error:
+    assert isinstance(error.reason, ssl.SSLCertVerificationError), type(error.reason)
+else:
+    raise AssertionError("An untrusted TLS certificate was accepted")
+print("PASS: 24 concurrent authenticated TLS connections; default trust rejects local certificate")
+PY
+
+# Exercise a real model through the packaged server, not a mock response. All
+# input is synthetic and sent only to the pinned loopback TLS listener. Model
+# downloads are public assets verified by the bundled downloader's SHA-256s.
+if [ "${YAP_PACKAGE_TEST_SYNTHESIS:-0}" = 1 ]; then
+  "$PY" -B "$APP/Contents/Resources/repo/backend/download_models.py" \
+    --models-dir "$DIR/models" > "$OUT/packaged-model-download.log" 2>&1
+  python3 - "$CERT" "$TOKEN" "$URL" "$OUT" <<'PY'
+from pathlib import Path
+import hashlib, io, json, ssl, sys, urllib.error, urllib.request, wave
+cert, token_path, base, output = sys.argv[1:]
+context = ssl.create_default_context(cafile=cert)
+token = Path(token_path).read_text()
+sample = ("This is synthetic speech for the Yap security integration test. "
+          "It contains no private information. The next sentence checks streaming. ") * 6
+payload = json.dumps({"text": sample, "voice": "af_heart"}).encode()
+receipts = {}
+for format_name in ("pcm", "wav"):
+    request = urllib.request.Request(base + "/synthesize?format=" + format_name,
+        data=payload, headers={"Authorization": "Bearer " + token,
+                               "Content-Type": "application/json"})
+    with urllib.request.urlopen(request, context=context, timeout=120) as response:
+        assert response.status == 200
+        audio = response.read(24_000 * 2 * 240 + 5)
+        assert len(audio) < 24_000 * 2 * 240, "Unexpectedly oversized audio response"
+        if format_name == "pcm":
+            assert response.headers.get("X-Stream-Footer") == "YEND"
+            assert audio.endswith(b"YEND"), "Incomplete PCM stream"
+            pcm = audio[:-4]
+            assert len(pcm) > 4_800 and len(pcm) % 2 == 0 and any(pcm)
+            frames = len(pcm) // 2
+        else:
+            with wave.open(io.BytesIO(audio)) as wav:
+                assert (wav.getframerate(), wav.getnchannels(), wav.getsampwidth()) == (24_000, 1, 2)
+                frames = wav.getnframes()
+                assert frames > 2_400 and any(wav.readframes(frames))
+        receipts[format_name] = {"bytes": len(audio), "frames": frames,
+                                "sha256": hashlib.sha256(audio).hexdigest()}
+# A browser origin cannot use even a valid credential to invoke synthesis.
+blocked = urllib.request.Request(base + "/synthesize", data=payload, headers={
+    "Authorization": "Bearer " + token, "Content-Type": "application/json",
+    "Origin": "https://security-test.invalid"})
+try:
+    urllib.request.urlopen(blocked, context=context, timeout=10)
+except urllib.error.HTTPError as error:
+    assert error.code == 403, error.code
+else:
+    raise AssertionError("Browser-origin synthesis was accepted")
+Path(output, "packaged-synthesis.json").write_text(json.dumps(receipts, indent=2) + "\n")
+print("PASS: real hash-verified Kokoro synthesis over TLS; PCM completion footer, WAV format, browser-origin rejection")
+PY
 fi
 
 # Ensure the keys cannot be read by another local user.
