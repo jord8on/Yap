@@ -6,6 +6,19 @@ highlight text anywhere, press a hotkey, hear it in a local Kokoro or Pocket TTS
 voice. Ears: press a shortcut, speak, and local Parakeet STT types the text
 at your cursor in any app. No cloud, no account, no telemetry.
 
+## Input-event security invariant
+
+- Never add a global key-down/character monitor, a CGEvent tap, or an IOHID
+  keyboard listener. Yap must not collect ordinary typed input.
+- The only global event monitor is the modifier-only hotkey path in
+  `HotKey.swift`; it listens to `.flagsChanged` only and is installed only
+  when the user chooses a modifier-only chord.
+- The only local key-down monitor is `HotKeyRecorder` in Settings, while the
+  user explicitly records a shortcut. It must be removed on commit or when the
+  view disappears.
+- Reading selected text is an explicit user-triggered Accessibility operation;
+  synthetic ⌘C/⌘V events are generated only for that capture/insert flow.
+
 ## What it is, and where the source lives
 
 Two processes. Neither works without the other.
@@ -44,6 +57,18 @@ pieces an agent must keep in sync if touching either side:
   gets stopped and relaunched, and an unverified foreign listener is refused
   outright. `ownsProcess` means "we may end this process", not "we started it".
   The full decision table: `docs/ARCHITECTURE.md`.
+
+## Model-download network invariant
+
+- Before any model load or sidecar launch, `ModelNetworkPolicy.apply()` must
+  pin FluidAudio to `https://huggingface.co`, remove ambient Hugging Face
+  credentials and custom endpoint overrides, and disable implicit token use
+  and Hugging Face telemetry.
+- Yap uses public model assets; never forward a user's HF token or allow
+  `REGISTRY_URL`, `MODEL_REGISTRY_URL`, or `HF_ENDPOINT` to redirect a request.
+- Model files must be hash-verified before use. Model downloads may fetch
+  public weights; audio, transcripts, selected text, and clipboard contents
+  must never be uploaded to model hosts.
 
 ## Two engines (Kokoro + Pocket TTS)
 
@@ -221,12 +246,13 @@ and writes `dist/python-runtime/`. `build_app.sh` embeds that at
 and spawns `server.py` directly; only a dev checkout with no embedded runtime
 falls back to `run_backend.sh` (venv from system Python).
 
-Gatekeeper reality: ad-hoc signed + downloaded-from-browser = quarantine →
-"damaged and can't be opened." The app self-strips its own quarantine on launch
-(`BackendManager.stripQuarantine`) so the nested Python can spawn, but the main
-app still needs `xattr -cr` or notarization. True double-click distribution
-requires `scripts/notarize.sh` + a paid Apple Developer ID. Don't claim
-"download and run" works frictionless until it's notarized.
+Gatekeeper policy: never remove `com.apple.quarantine` from the app or
+nested executables as a launch workaround. Runtime code and packaging scripts
+must preserve quarantine; no `xattr -cr` / `xattr -dr` bypasses. Public ad-hoc
+builds are not notarized and may be blocked by Gatekeeper. Do not tell users to
+force them open by stripping quarantine. A friction-free downloaded release
+requires `scripts/notarize.sh` and a paid Apple Developer ID. Local source builds
+are the appropriate route for development testing.
 
 ## Where state lives (not in the repo)
 
@@ -388,8 +414,9 @@ persist across rebuilds.)
 
 Versioned in `app/Resources/Info.plist` (`CFBundleShortVersionString`).
 `make_dmg.sh` reads it for the DMG name. App is ad-hoc signed, not notarized.
-Three install paths exist (see README): Homebrew cask, DMG + `xattr -cr`,
-build-from-source.
+Three install paths exist (see README): Homebrew cask, DMG, and build-from-source.
+The cask and DMG must preserve quarantine; only a notarized release is intended
+for friction-free download/install.
 
 `scripts/release.sh` never writes to `main` of either repo. Two steps:
 
@@ -413,10 +440,9 @@ scripts/release.sh publish X.Y.Z [--yes] [--no-install] [--dry-run]
   the plan. If main moved after prepare, rerun prepare.
 
 Refresh an existing release's binary in place:
-`gh release upload vX.Y.Z dist/Yap-X.Y.Z.dmg --clobber`. The cask's
-`postflight` runs `xattr -cr`, so `brew install --cask latent-variable/tap/yap`
-installs with no Gatekeeper prompt; skipping the tap PR leaves brew users on
-the old version.
+`gh release upload vX.Y.Z dist/Yap-X.Y.Z.dmg --clobber`. The cask must not remove
+quarantine in `postflight`. Keep its SHA-256 in sync with the reviewed release;
+a non-notarized cask may still be blocked by Gatekeeper.
 
 ## Acceleration (measured, not assumed)
 

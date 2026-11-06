@@ -9,8 +9,15 @@ server is covered by the curl e2e in the PR description.
 Run: cd backend && pytest tests/test_auth.py -v
 """
 import asyncio
+import errno
 import hashlib
 import hmac
+import os
+import re
+import ssl
+import stat
+import subprocess
+from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
@@ -18,6 +25,7 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 
 import server
+from local_tls import ensure_identity
 
 TOKEN = "unit-test-secret-token"
 
@@ -82,6 +90,173 @@ def test_sec_fetch_same_origin_allowed():
 def test_install_endpoint_csrf_blocked_without_token():
     # The no-body POST a malicious page would fire to trigger a multi-GB pip run.
     assert _run_guard(_request(path="/engines/pocket/install")).status_code == 401
+
+
+def test_missing_token_fails_closed_for_all_routes(monkeypatch):
+    monkeypatch.setattr(server, "AUTH_TOKEN", None)
+    assert _run_guard(_request(path="/health", headers=_auth())).status_code == 503
+    assert _run_guard(_request(path="/engines/pocket/install", headers=_auth())).status_code == 503
+    assert _run_guard(_request(path="/verify")).status_code == 503
+
+
+def test_unwritable_token_path_never_creates_a_public_server(monkeypatch, tmp_path):
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("blocker")
+    monkeypatch.delenv("YAP_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("YAP_AUTH_TOKEN_FILE", str(blocker / "auth-token"))
+    assert server._load_or_create_token() is None
+
+
+def test_auth_token_file_refuses_symlink(monkeypatch, tmp_path):
+    target = tmp_path / "target"
+    target.write_text("sensitive")
+    link = tmp_path / "auth-token"
+    link.symlink_to(target)
+    monkeypatch.delenv("YAP_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("YAP_AUTH_TOKEN_FILE", str(link))
+    assert server._load_or_create_token() is None
+    assert target.read_text() == "sensitive"
+
+
+def test_fresh_standalone_auth_parent_supports_tls_under_normal_umask(monkeypatch, tmp_path):
+    token_file = tmp_path / "fresh-profile" / "auth-token"
+    monkeypatch.delenv("YAP_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("YAP_AUTH_TOKEN_FILE", str(token_file))
+    previous_umask = os.umask(0o022)
+    try:
+        token = server._load_or_create_token()
+    finally:
+        os.umask(previous_umask)
+    assert token
+    assert token_file.read_text() == token
+    assert stat.S_IMODE(token_file.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(token_file.stat().st_mode) == 0o600
+    cert, key = ensure_identity(token_file)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certfile=str(cert), keyfile=str(key))
+
+
+@pytest.mark.parametrize("mode", [0o755, 0o777])
+def test_existing_unsafe_auth_parent_is_refused_without_changes(monkeypatch, tmp_path, mode):
+    parent = tmp_path / "shared-parent"
+    parent.mkdir(mode=mode)
+    parent.chmod(mode)
+    token_file = parent / "auth-token"
+    token_file.write_text("existing-token")
+    token_file.chmod(0o600)
+    monkeypatch.delenv("YAP_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("YAP_AUTH_TOKEN_FILE", str(token_file))
+    assert server._load_or_create_token() is None
+    assert stat.S_IMODE(parent.stat().st_mode) == mode
+    assert token_file.read_text() == "existing-token"
+    assert sorted(p.name for p in parent.iterdir()) == ["auth-token"]
+
+
+def test_symlink_auth_parent_is_refused_without_creating_token(monkeypatch, tmp_path):
+    target = tmp_path / "target-parent"
+    target.mkdir(mode=0o700)
+    parent = tmp_path / "linked-parent"
+    parent.symlink_to(target, target_is_directory=True)
+    monkeypatch.delenv("YAP_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("YAP_AUTH_TOKEN_FILE", str(parent / "auth-token"))
+    assert server._load_or_create_token() is None
+    assert parent.is_symlink()
+    assert list(target.iterdir()) == []
+
+
+def test_foreign_owned_auth_parent_is_refused(monkeypatch, tmp_path):
+    parent = tmp_path / "foreign-parent"
+    parent.mkdir(mode=0o700)
+    monkeypatch.delenv("YAP_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("YAP_AUTH_TOKEN_FILE", str(parent / "auth-token"))
+    monkeypatch.setattr(server.os, "geteuid", lambda: parent.stat().st_uid + 1)
+    assert server._load_or_create_token() is None
+    assert list(parent.iterdir()) == []
+
+
+def _run_support_directory_migration(path):
+    # Execute the actual Bash function without sourcing the launcher: sourcing
+    # would bootstrap a venv/download dependencies or start the backend.
+    launcher = Path(__file__).resolve().parents[2] / "scripts" / "run_backend.sh"
+    function = re.search(r"(?ms)^secure_support_directory\(\) \{.*?^\}", launcher.read_text())
+    assert function is not None, "The launcher must provide its tested support-directory migration"
+    return subprocess.run(
+        ["/bin/bash", "-c", function.group() + '\nsecure_support_directory "$1"',
+         "yap-support-directory-test", str(path)],
+        capture_output=True, text=True, timeout=5,
+    )
+
+
+@pytest.mark.parametrize("existing_mode", [None, 0o755], ids=["fresh", "legacy-0755"])
+def test_launcher_private_support_directory_supports_auth_and_tls(monkeypatch, tmp_path, existing_mode):
+    parent = tmp_path / "Yap support"
+    token_file = parent / "auth-token"
+    if existing_mode is not None:
+        parent.mkdir(mode=existing_mode)
+        parent.chmod(existing_mode)
+        token_file.write_text("preserved-legacy-token")
+        token_file.chmod(0o600)
+    result = _run_support_directory_migration(parent)
+    assert result.returncode == 0, result.stderr
+    assert stat.S_IMODE(parent.stat().st_mode) == 0o700
+    monkeypatch.delenv("YAP_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("YAP_AUTH_TOKEN_FILE", str(token_file))
+    token = server._load_or_create_token()
+    assert token
+    if existing_mode is not None:
+        assert token == "preserved-legacy-token"
+    cert, key = ensure_identity(token_file)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certfile=str(cert), keyfile=str(key))
+
+
+def test_launcher_refuses_symlink_support_directory_without_chmod(tmp_path):
+    target = tmp_path / "untouched-target"
+    target.mkdir(mode=0o755)
+    target.chmod(0o755)
+    marker = target / "marker"
+    marker.write_text("untouched")
+    link = tmp_path / "Yap support"
+    link.symlink_to(target, target_is_directory=True)
+    result = _run_support_directory_migration(link)
+    assert result.returncode != 0
+    assert "refusing unsafe support directory" in result.stderr
+    assert link.is_symlink()
+    assert stat.S_IMODE(target.stat().st_mode) == 0o755
+    assert marker.read_text() == "untouched"
+    assert sorted(p.name for p in target.iterdir()) == ["marker"]
+
+
+def test_launcher_refuses_non_directory_support_path(tmp_path):
+    path = tmp_path / "Yap support"
+    path.write_text("untouched")
+    result = _run_support_directory_migration(path)
+    assert result.returncode != 0
+    assert "refusing unsafe support directory" in result.stderr
+    assert path.read_text() == "untouched"
+
+
+def test_launcher_refuses_foreign_owned_support_directory_without_chmod(tmp_path):
+    if os.geteuid() != 0:
+        pytest.skip("Creating a disposable foreign-owned directory requires root")
+    path = tmp_path / "foreign-support"
+    path.mkdir(mode=0o755)
+    path.chmod(0o755)
+    try:
+        os.chown(path, 65534, -1)
+    except OSError as error:
+        if error.errno not in (errno.EPERM, errno.EACCES, errno.EINVAL, errno.ENOTSUP):
+            raise
+        pytest.skip("This environment cannot create a disposable foreign-owned directory")
+    try:
+        result = _run_support_directory_migration(path)
+        assert result.returncode != 0
+        assert "owned by this user" in result.stderr
+        assert path.stat().st_uid == 65534
+        assert stat.S_IMODE(path.stat().st_mode) == 0o755
+        assert list(path.iterdir()) == []
+    finally:
+        os.chown(path, os.geteuid(), -1)
 
 
 def test_verify_is_auth_exempt():

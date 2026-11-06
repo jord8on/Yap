@@ -1,7 +1,7 @@
 # Architecture
 
 Voice runs across two local processes: a native SwiftUI menu-bar app talks to a
-Python TTS sidecar over loopback HTTP. Ears stay in the app: AVAudioEngine
+Python TTS sidecar over certificate-pinned loopback HTTPS. Ears stay in the app: AVAudioEngine
 captures the microphone and FluidAudio runs local streaming and batch ASR. The
 sidecar hosts two interchangeable engines (Kokoro default, Pocket TTS opt-in)
 behind one int16-PCM contract.
@@ -20,7 +20,7 @@ behind one int16-PCM contract.
 | Refused-read notice next to the pointer (shows with sounds muted, never takes focus) | `Notice.swift` |
 | Accessibility permission | `Permissions.swift` |
 | Preprocessing / cleanup | `Preprocess.swift` |
-| Backend HTTP client | `BackendClient.swift` |
+| Backend HTTPS client with per-connection certificate pinning | `BackendClient.swift` |
 | Backend process supervisor | `BackendManager.swift` |
 | Streaming audio engine (pre-buffer, live speed) | `AudioPlayer.swift` |
 | Reference-clip import (→ mono 24k WAV) | `AudioImport.swift` |
@@ -28,6 +28,7 @@ behind one int16-PCM contract.
 | Cloned Pocket voice ID rules | `VoiceID.swift` |
 | Cloning reference-clip recorder | `VoiceRecorder.swift` |
 | Model download | `ModelDownloader.swift` (owned by `AppState` so a download survives closing Settings) |
+| Model network policy (official Hugging Face host, no ambient tokens or telemetry) | `ModelNetworkPolicy.swift` |
 | Model management (size on disk, delete, re-download) | `AppState.swift` + `Views/SettingsView.swift` (Models tab) |
 | Launch at login | `LoginItem.swift` |
 | Views | `Views/MenuContent.swift`, `Views/SettingsView.swift`, `Views/VoiceSelector.swift`, `Views/StableToggleStyle.swift` |
@@ -36,6 +37,7 @@ behind one int16-PCM contract.
 | Settings ▸ Agents: the copy-ready "Speak to me" instructions for coding agents | `Views/AgentsTab.swift` |
 | UI screenshots of the menu and every Settings pane, light and dark (`--uishot <dir>`, sample history, never the user's) | `UIShotProbe.swift` |
 | Logic self-test / pipe probe | `Selftest.swift`, `CLITest.swift` |
+| Packaged privacy probe (`--privacytest`, disposable bundle/defaults identity, no microphone capture) | `PrivacyProbe.swift` + `scripts/ci/test-packaged-privacy.sh` |
 | **Dictation (ears)** | |
 | Microphone capture, streaming ASR, accurate batch transcription + rolling preview | `Dictation.swift` |
 | Dictation hotkey, floating HUD, transcript stitching + orchestration | `DictationController.swift` |
@@ -237,7 +239,7 @@ Covered by `TestStreamIntegrity` (live uvicorn, raw socket, plus a control that 
 
 Something already answering is not automatically reused. `start()` decides:
 
-- **Unverified** (`verifyAuthentic()` fails — it can't prove it knows the shared secret). An identifiable Yap orphan (a `server.py` reparented to launchd, ppid 1) is almost always a stale pre-auth backend left over from an upgrade, so it's killed and a fresh authenticated one launched. Anything else is a foreign listener squatting the port: refused with an error, never handed captured text.
+- **Unverified** (TLS pinning or the HMAC proof fails). An occupied port is refused with an error; no bearer token or captured text is sent. The app does not kill or adopt that listener based on its process name. The user must stop an obsolete or foreign listener before retrying.
 - **Verified and ready** — reused.
 - **Verified but not ready** (responding, no model it can serve). If it's an adopted orphan, it's stopped and relaunched; if it's external, it's left alone and `start()` bails rather than racing a second process onto the same port.
 

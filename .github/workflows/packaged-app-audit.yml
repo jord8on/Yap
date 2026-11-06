@@ -1,0 +1,76 @@
+name: Inspect isolated packaged Yap app and DMG
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/packaged-app-audit.yml"
+      - "scripts/ci/inspect-packaged-yap.sh"
+      - "scripts/ci/test-packaged-local-tls.sh"
+      - "scripts/ci/test-packaged-privacy.sh"
+      - "scripts/build_app.sh"
+      - "scripts/make_dmg.sh"
+      - "scripts/bundle_python.sh"
+      - "backend/**"
+      - "app/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: yap-package-audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package-and-inspect:
+    name: Build actual app, mount DMG, record release security gaps
+    runs-on: macos-26
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Host details and Xcode
+        run: |
+          set -euo pipefail
+          uname -a
+          xcodebuild -version
+          df -h .
+          test "$(uname -m)" = "arm64"
+          mkdir -p dist/security-audit
+
+      - name: Build actual bundled Yap.app (no local Mac)
+        env:
+          PARLEY_BUNDLE_PYTHON: "1"
+        run: |
+          set -euo pipefail
+          bash scripts/build_app.sh release 2>&1 | tee dist/security-audit/build.log
+
+      - name: Assemble DMG from exact built bundle
+        run: |
+          set -euo pipefail
+          bash scripts/make_dmg.sh --no-build 2>&1 | tee dist/security-audit/dmg-build.log
+
+      - name: Exercise packaged HTTPS sidecar and reject cleartext requests
+        env:
+          YAP_PACKAGE_TEST_SYNTHESIS: "1"
+        run: |
+          set -euo pipefail
+          bash scripts/ci/test-packaged-local-tls.sh 2>&1 | tee dist/security-audit/https-smoke.log
+
+      - name: Exercise packaged privacy defaults and opt-in controls
+        run: |
+          set -euo pipefail
+          bash scripts/ci/test-packaged-privacy.sh 2>&1 | tee dist/security-audit/privacy-smoke.log
+
+      - name: Inspect bundle, embedded runtime and mounted DMG
+        run: |
+          set -euo pipefail
+          bash scripts/ci/inspect-packaged-yap.sh 2>&1 | tee dist/security-audit/audit.log
+
+      - name: Upload full audit receipts (no installers distributed)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: yap-isolated-package-audit-${{ github.run_id }}
+          path: dist/security-audit/
+          if-no-files-found: warn
+          retention-days: 7
