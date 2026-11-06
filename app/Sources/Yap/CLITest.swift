@@ -148,7 +148,7 @@ extension CLITest {
         print("── tail probe  chars=\(cleaned.count)  cap=\(AudioPlayer.maxQueuedSeconds)s")
         Task {
             var client = BackendClient()
-            client.base = URL(string: "http://127.0.0.1:\(port)")!
+            client.base = URL(string: "https://127.0.0.1:\(port)")!
 
             // Reference: one non-streamed render of the same text. Any shortfall
             // against this is bytes the stream never delivered.
@@ -340,7 +340,9 @@ extension CLITest {
                 try fm.createDirectory(at: scripts, withIntermediateDirectories: true)
                 try fm.createDirectory(at: models, withIntermediateDirectories: true)
                 let python = #"""
-                import hashlib, hmac, http.server, json, os, ssl, subprocess, sys, urllib.parse
+                import faulthandler, hashlib, hmac, http.server, json, os, ssl, subprocess, sys, urllib.parse
+                faulthandler.enable()
+                faulthandler.dump_traceback_later(5, repeat=True)
                 from pathlib import Path
 
                 port, pid_file, starts_file, models_dir = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
@@ -362,6 +364,7 @@ extension CLITest {
                 class Handler(http.server.BaseHTTPRequestHandler):
                     def do_GET(self):
                         parsed = urllib.parse.urlsplit(self.path)
+                        print("recovery fixture GET", parsed.path, "pid", os.getpid(), flush=True)
                         if parsed.path == "/verify":
                             nonce = urllib.parse.parse_qs(parsed.query).get("nonce", [""])[0]
                             if not nonce or len(nonce) > 128:
@@ -416,6 +419,7 @@ extension CLITest {
                 context.load_cert_chain(certfile=str(cert), keyfile=str(key))
                 httpd = Server(("127.0.0.1", port), Handler)
                 httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+                print("recovery fixture HTTPS ready", os.getpid(), port, flush=True)
                 httpd.serve_forever()
                 """#
                 let script = "#!/bin/bash\nexec python3 \(shellQuote(server.path)) \"$YAP_PORT\" \(shellQuote(pidFile.path)) \(shellQuote(startsFile.path)) \(shellQuote(models.path))\n"

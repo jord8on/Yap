@@ -124,8 +124,16 @@ struct BackendClient {
         var req = URLRequest(url: url)
         req.timeoutInterval = 2
         struct Resp: Decodable { let proof: String }
-        guard let (data, response) = try? await session.data(for: req),
-              let http = response as? HTTPURLResponse, http.statusCode == 200,
+        let result: (Data, URLResponse)
+        do { result = try await session.data(for: req) }
+        catch {
+            let issue = error as NSError
+            print("recovery verify transport error domain=\(issue.domain) code=\(issue.code)")
+            return false
+        }
+        let (data, response) = result
+        print("recovery verify HTTP status=\((response as? HTTPURLResponse)?.statusCode ?? -1)")
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200,
               let r = try? JSONDecoder().decode(Resp.self, from: data) else { return false }
         // Constant-time compare: don't short-circuit on the first mismatching
         // hex digit, so the proof check can't leak per-byte timing (server side
@@ -134,6 +142,7 @@ struct BackendClient {
         guard a.count == b.count else { return false }
         var diff: UInt8 = 0
         for i in 0..<a.count { diff |= a[i] ^ b[i] }
+        print("recovery verify proof matches=\(diff == 0)")
         return diff == 0
     }
 
