@@ -33,6 +33,8 @@ import wave
 from pathlib import Path
 from typing import Iterator, Optional
 
+from local_tls import ensure_identity
+
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -483,12 +485,12 @@ def hd_voice_path(voice_id: str) -> Optional[Path]:
 # process AND by `fetch()` from any website the user visits. Two holes that
 # closes: (1) a website CSRFing a no-body POST (e.g. the multi-GB pip install),
 # and (2) Yap reusing an impostor that squatted the port and then receiving
-# captured selected text. Defense: a shared secret in a 0600 file both the app
-# and this backend read-or-create. Every request must carry it as a Bearer
-# token; cross-user processes can't read the file, so they can't forge it. The
-# app proves a *reused* backend is genuine via /verify (HMAC challenge) before
-# trusting it. Same-user attackers are out of scope — they already own the
-# user's data and Accessibility grants.
+# captured selected text. Defense: a shared secret in a 0600 file both sides
+# read-or-create, plus a per-user TLS private key in the same private directory.
+# The client pins the local TLS certificate on EVERY connection, before HTTP
+# headers or user text are sent. The /verify HMAC is defense in depth, not a
+# substitute for a connection-bound identity check. Same-user attackers who
+# can read private files are outside this trust boundary.
 def _load_or_create_token() -> Optional[str]:
     # Explicit path wins (the app passes it when spawning us); else the default
     # app-support location, which the app uses too. A hand-started dev backend
@@ -502,7 +504,21 @@ def _load_or_create_token() -> Optional[str]:
         return inline.strip() or None
     p = Path(path)
     try:
+        # TLS identity files share this directory. Create a private leaf on a
+        # fresh standalone launch, and never trust or chmod an unsafe custom
+        # parent supplied through YAP_AUTH_TOKEN_FILE.
+        p.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        parent = p.parent.lstat()
+        if (not stat.S_ISDIR(parent.st_mode)
+                or parent.st_uid != os.geteuid()
+                or parent.st_mode & 0o077):
+            raise OSError("auth token directory must be user-owned and private (0700)")
+        # Refuse symlink paths and non-regular token files.
+        if p.is_symlink():
+            raise OSError("auth token path must not be a symlink")
         if p.exists():
+            if not stat.S_ISREG(p.stat().st_mode):
+                raise OSError("auth token path must be a regular file")
             # Refuse a token file any group/other can access — someone may have
             # pre-created it (e.g. a custom YAP_AUTH_TOKEN_FILE in a shared dir)
             # to read or fix the secret. Recreate it 0600 instead of trusting it.
@@ -514,23 +530,25 @@ def _load_or_create_token() -> Optional[str]:
                 tok = p.read_text().strip()
                 if tok:
                     return tok
-        p.parent.mkdir(parents=True, exist_ok=True)
         tok = secrets.token_urlsafe(32)
         # Write 0600 atomically: create with restrictive mode, then write.
-        fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
+        # Exclusive creation prevents silently truncating an injected file.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(str(p), flags, stat.S_IRUSR | stat.S_IWUSR)
         with os.fdopen(fd, "w") as f:
             f.write(tok)
         os.chmod(str(p), stat.S_IRUSR | stat.S_IWUSR)
         return tok
     except OSError as e:
-        # Fail open on the Bearer check rather than bricking TTS, but the Origin
-        # guard below still runs, so CSRF stays closed even here.
-        # nosemgrep: python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure -- an OSError carries errno and path, never the file's contents
-        log.warning("auth: could not load/create token (%s); Bearer auth disabled", e)
+        log.error("backend initialization failed; service will not start")
         return None
 
 
 AUTH_TOKEN = _load_or_create_token()
+if AUTH_TOKEN is None:
+    raise RuntimeError("Yap backend auth unavailable: refusing to start without a token")
 
 
 def _is_browser_request(request: Request) -> bool:
@@ -556,20 +574,17 @@ async def auth_guard(request: Request, call_next):
     # probe to /verify. The native Swift client sets no Origin/Sec-Fetch-Site.
     if _is_browser_request(request):
         return JSONResponse({"detail": "cross-origin requests are not allowed"}, status_code=403)
-    # /verify self-authenticates (it returns an HMAC over a caller nonce and
-    # leaks nothing), so the app can probe an unknown listener without first
-    # handing it the token.
+    # Defense in depth if a test/future refactor bypasses the startup guard.
+    if AUTH_TOKEN is None:
+        return JSONResponse({"detail": "authorization unavailable"}, status_code=503)
+    # The unauthenticated /verify challenge returns an HMAC, never the secret.
     if request.url.path == "/verify":
         return await call_next(request)
-    if AUTH_TOKEN is not None:
-        header = request.headers.get("authorization", "")
-        prefix = "Bearer "
-        presented = header[len(prefix):] if header.startswith(prefix) else ""
-        # Compare as bytes: compare_digest raises ValueError on non-ASCII str
-        # (Starlette decodes the header latin-1), which would 500 instead of a
-        # clean 401 if a client sent non-ASCII in Authorization.
-        if not presented or not hmac.compare_digest(presented.encode(), AUTH_TOKEN.encode()):
-            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    header = request.headers.get("authorization", "")
+    prefix = "Bearer "
+    presented = header[len(prefix):] if header.startswith(prefix) else ""
+    if not presented or not hmac.compare_digest(presented.encode(), AUTH_TOKEN.encode()):
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
     return await call_next(request)
 
 
@@ -1069,7 +1084,13 @@ def main() -> None:
         engine.load()
 
     import uvicorn
-    log.info("serving on http://%s:%d (models: %s)", args.host, args.port, mdir)
+    # A /verify challenge followed by a different HTTP connection has a
+    # check-to-use race. TLS authenticates the listener on *each connection*
+    # before the Bearer header or captured text can leave the app.
+    token_file = Path(os.environ.get("YAP_AUTH_TOKEN_FILE") or
+                      Path.home() / "Library/Application Support/Yap/auth-token")
+    cert_file, key_file = ensure_identity(token_file)
+    log.info("serving on https://%s:%d (models: %s)", args.host, args.port, mdir)
     # KEEP_ALIVE, not a default: /synthesize is read at PLAYBACK rate.
     #
     # The app deliberately stalls its read while more than ~10s of audio is
@@ -1084,7 +1105,8 @@ def main() -> None:
     # 5s window, which is why this survived until reads got backpressured.
     # Regression probe: `Yap --tailtest <file>`.
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning",
-                timeout_keep_alive=KEEP_ALIVE)
+                timeout_keep_alive=KEEP_ALIVE,
+                ssl_certfile=str(cert_file), ssl_keyfile=str(key_file))
 
 
 if __name__ == "__main__":

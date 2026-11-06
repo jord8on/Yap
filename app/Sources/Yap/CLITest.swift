@@ -148,7 +148,7 @@ extension CLITest {
         print("── tail probe  chars=\(cleaned.count)  cap=\(AudioPlayer.maxQueuedSeconds)s")
         Task {
             var client = BackendClient()
-            client.base = URL(string: "http://127.0.0.1:\(port)")!
+            client.base = URL(string: "https://127.0.0.1:\(port)")!
 
             // Reference: one non-streamed render of the same text. Any shortfall
             // against this is bytes the stream never delivered.
@@ -326,6 +326,7 @@ extension CLITest {
     /// ready, then drive the same start decision the next read uses. A fake local
     /// sidecar keeps the probe independent of installed TTS models.
     static func runBackendRecovery(port: Int) -> Never {
+        setvbuf(stdout, nil, _IOLBF, 0)
         Task { @MainActor in
             let fm = FileManager.default
             let fixture = fm.temporaryDirectory.appending(path: "yap-backend-recovery-\(UUID().uuidString)")
@@ -339,9 +340,15 @@ extension CLITest {
                 try fm.createDirectory(at: scripts, withIntermediateDirectories: true)
                 try fm.createDirectory(at: models, withIntermediateDirectories: true)
                 let python = #"""
-                import http.server, json, os, sys
+                import hashlib, hmac, http.server, json, os, socketserver, ssl, subprocess, sys, urllib.parse
+                from pathlib import Path
 
                 port, pid_file, starts_file, models_dir = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+                # The production backend now requires HMAC identity proof
+                # before /health sends any Authorization header.
+                with open(os.environ["YAP_AUTH_TOKEN_FILE"], encoding="utf-8") as f:
+                    token = f.read().strip()
+                assert token
                 try:
                     with open(starts_file) as f:
                         starts = int(f.read()) + 1
@@ -354,27 +361,84 @@ extension CLITest {
 
                 class Handler(http.server.BaseHTTPRequestHandler):
                     def do_GET(self):
-                        if self.path != "/health":
+                        parsed = urllib.parse.urlsplit(self.path)
+                        print("recovery fixture GET", parsed.path, "pid", os.getpid(), flush=True)
+                        if parsed.path == "/verify":
+                            nonce = urllib.parse.parse_qs(parsed.query).get("nonce", [""])[0]
+                            if not nonce or len(nonce) > 128:
+                                self.send_error(400)
+                                return
+                            proof = hmac.new(token.encode(), nonce.encode(), hashlib.sha256).hexdigest()
+                            body = json.dumps({"proof": proof}).encode()
+                        elif parsed.path == "/health":
+                            if self.headers.get("Authorization") != "Bearer " + token:
+                                self.send_error(401)
+                                return
+                            body = json.dumps({
+                                "status": "ok", "model_loaded": True, "files_present": True,
+                                "models_dir": models_dir, "error": None, "sample_rate": 24000,
+                                "provider_mode": "cpu", "active_providers": ["CPUExecutionProvider"],
+                                "available_providers": ["CPUExecutionProvider"]
+                            }).encode()
+                        else:
                             self.send_error(404)
                             return
-                        body = json.dumps({
-                            "status": "ok", "model_loaded": True, "files_present": True,
-                            "models_dir": models_dir, "error": None, "sample_rate": 24000,
-                            "provider_mode": "cpu", "active_providers": ["CPUExecutionProvider"],
-                            "available_providers": ["CPUExecutionProvider"]
-                        }).encode()
                         self.send_response(200)
                         self.send_header("Content-Type", "application/json")
                         self.send_header("Content-Length", str(len(body)))
                         self.end_headers()
                         self.wfile.write(body)
+
                     def log_message(self, *_):
                         pass
 
                 class Server(http.server.ThreadingHTTPServer):
                     allow_reuse_address = True
+                    daemon_threads = True
 
-                Server(("127.0.0.1", port), Handler).serve_forever()
+                    def server_bind(self):
+                        # HTTPServer normally calls getfqdn here. A loopback
+                        # fixture needs no DNS, which can stall hosted runners.
+                        socketserver.TCPServer.server_bind(self)
+                        self.server_name = "127.0.0.1"
+                        self.server_port = self.server_address[1]
+
+                    def get_request(self):
+                        connection, address = super().get_request()
+                        connection.settimeout(5)
+                        return context.wrap_socket(
+                            connection, server_side=True, do_handshake_on_connect=False
+                        ), address
+
+                    def finish_request(self, request, client_address):
+                        # Negotiate inside the worker: an idle TLS connection
+                        # must not block acceptance of another health request.
+                        request.do_handshake()
+                        super().finish_request(request, client_address)
+
+                # The fake backend also speaks pinned HTTPS. Using the same
+                # private certificate path as the real server proves recovery
+                # works after authentication is bound to the TLS connection.
+                cert_dir = Path(os.environ["YAP_AUTH_TOKEN_FILE"]).parent
+                cert = cert_dir / "backend-tls-cert.pem"
+                key = cert_dir / "backend-tls-key.pem"
+                if not cert.exists() or not key.exists():
+                    subprocess.run(
+                        ["/usr/bin/openssl", "req", "-x509", "-newkey", "rsa:2048",
+                         "-nodes", "-days", "3650", "-subj", "/CN=127.0.0.1",
+                         "-addext", "subjectAltName=IP:127.0.0.1",
+                         "-addext", "extendedKeyUsage=serverAuth",
+                         "-keyout", str(key), "-out", str(cert)],
+                        check=True, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    os.chmod(key, 0o600)
+                    os.chmod(cert, 0o600)
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                context.load_cert_chain(certfile=str(cert), keyfile=str(key))
+                httpd = Server(("127.0.0.1", port), Handler)
+                print("recovery fixture HTTPS ready", os.getpid(), port, flush=True)
+                httpd.serve_forever()
                 """#
                 let script = "#!/bin/bash\nexec python3 \(shellQuote(server.path)) \"$YAP_PORT\" \(shellQuote(pidFile.path)) \(shellQuote(startsFile.path)) \(shellQuote(models.path))\n"
                 try Data(python.utf8).write(to: server)
@@ -387,7 +451,9 @@ extension CLITest {
 
             let manager = BackendManager(port: port, repoRootOverride: fixture)
             @MainActor func finish(_ message: String, _ code: Int32) async -> Never {
+                print("   stopping recovery fixture")
                 await manager.stopAndWait()
+                print("   fixture stopped; removing temporary files")
                 do { try fm.trashItem(at: fixture, resultingItemURL: nil) }
                 catch { print("   · could not trash temporary fixture: \(error.localizedDescription)") }
                 print(message)
@@ -396,6 +462,7 @@ extension CLITest {
 
             print("── backend recovery probe  port=\(port)")
             await manager.start()
+            print("   initial ready=\(manager.ready) owned=\(manager.ownsProcess) error=\(manager.lastError ?? "none")")
             guard manager.ready, manager.ownsProcess,
                   let firstPIDText = try? String(contentsOf: pidFile, encoding: .utf8),
                   let firstPID = Int32(firstPIDText.trimmingCharacters(in: .whitespacesAndNewlines)),
@@ -406,6 +473,7 @@ extension CLITest {
             if kill(firstPID, SIGKILL) != 0 {
                 await finish("   ✗ could not terminate the owned backend\n\n1 FAILURE(S)", 1)
             }
+            print("   killed initial pid=\(firstPID)")
             for _ in 0..<100 where !manager.needsStart {
                 try? await Task.sleep(nanoseconds: 50_000_000)
             }
@@ -413,7 +481,9 @@ extension CLITest {
                 await finish("   ✗ dead child still looked ready to the next read\n\n1 FAILURE(S)", 1)
             }
 
+            print("   needsStart=\(manager.needsStart); starting replacement")
             await manager.start()
+            print("   replacement ready=\(manager.ready) owned=\(manager.ownsProcess) error=\(manager.lastError ?? "none")")
             let starts = (try? String(contentsOf: startsFile, encoding: .utf8))
                 .flatMap(Int.init) ?? 0
             let secondPID = (try? String(contentsOf: pidFile, encoding: .utf8))
