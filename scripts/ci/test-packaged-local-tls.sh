@@ -3,6 +3,7 @@
 # .app. Runs with a private throwaway token/model directory. CI can opt into
 # downloading hash-pinned public Kokoro models and synthesizing test text.
 # The sidecar itself must work with outbound network connections denied.
+# This is a CI test condition, not a firewall installed in the production app.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 APP="$ROOT/dist/Yap.app"
@@ -78,6 +79,7 @@ assert canary["result"] == "denied" and canary["error_type"] == "PermissionError
 assert canary["errno"] in (errno.EPERM, errno.EACCES), canary
 receipt = {
     "scope": "packaged Python sidecar; not a full-app packet trace",
+    "test_condition_only": True,
     "profile_sha256": hashlib.sha256(Path(profile).read_bytes()).hexdigest(),
     "embedded_python_sha256": hashlib.sha256(Path(embedded_python).read_bytes()).hexdigest(),
     "canary": canary,
