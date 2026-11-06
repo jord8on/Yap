@@ -326,6 +326,7 @@ extension CLITest {
     /// ready, then drive the same start decision the next read uses. A fake local
     /// sidecar keeps the probe independent of installed TTS models.
     static func runBackendRecovery(port: Int) -> Never {
+        setvbuf(stdout, nil, _IOLBF, 0)
         Task { @MainActor in
             let fm = FileManager.default
             let fixture = fm.temporaryDirectory.appending(path: "yap-backend-recovery-\(UUID().uuidString)")
@@ -437,6 +438,7 @@ extension CLITest {
 
             print("── backend recovery probe  port=\(port)")
             await manager.start()
+            print("   initial ready=\(manager.ready) owned=\(manager.ownsProcess) error=\(manager.lastError ?? "none")")
             guard manager.ready, manager.ownsProcess,
                   let firstPIDText = try? String(contentsOf: pidFile, encoding: .utf8),
                   let firstPID = Int32(firstPIDText.trimmingCharacters(in: .whitespacesAndNewlines)),
