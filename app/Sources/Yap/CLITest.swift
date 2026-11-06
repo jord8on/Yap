@@ -429,7 +429,9 @@ extension CLITest {
 
             let manager = BackendManager(port: port, repoRootOverride: fixture)
             @MainActor func finish(_ message: String, _ code: Int32) async -> Never {
+                print("   stopping recovery fixture")
                 await manager.stopAndWait()
+                print("   fixture stopped; removing temporary files")
                 do { try fm.trashItem(at: fixture, resultingItemURL: nil) }
                 catch { print("   · could not trash temporary fixture: \(error.localizedDescription)") }
                 print(message)
@@ -449,6 +451,7 @@ extension CLITest {
             if kill(firstPID, SIGKILL) != 0 {
                 await finish("   ✗ could not terminate the owned backend\n\n1 FAILURE(S)", 1)
             }
+            print("   killed initial pid=\(firstPID)")
             for _ in 0..<100 where !manager.needsStart {
                 try? await Task.sleep(nanoseconds: 50_000_000)
             }
@@ -456,7 +459,9 @@ extension CLITest {
                 await finish("   ✗ dead child still looked ready to the next read\n\n1 FAILURE(S)", 1)
             }
 
+            print("   needsStart=\(manager.needsStart); starting replacement")
             await manager.start()
+            print("   replacement ready=\(manager.ready) owned=\(manager.ownsProcess) error=\(manager.lastError ?? "none")")
             let starts = (try? String(contentsOf: startsFile, encoding: .utf8))
                 .flatMap(Int.init) ?? 0
             let secondPID = (try? String(contentsOf: pidFile, encoding: .utf8))
