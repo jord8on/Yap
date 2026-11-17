@@ -15,7 +15,7 @@ LOCK="$ROOT/backend/requirements.txt"
 # shellcheck source=python_pin.sh
 . "$ROOT/scripts/python_pin.sh"
 
-STAMP="python=$PYTHON_SHA256 lock=$(shasum -a 256 "$LOCK" | awk '{print $1}')"
+STAMP="python=$PYTHON_SHA256 lock=$(shasum -a 256 "$LOCK" | awk '{print $1}') bytecode=none"
 if [ -x "$OUT/bin/python3" ] && [ "${1:-}" != "--force" ] && \
    [ "$(cat "$OUT/.yap-runtime-stamp" 2>/dev/null)" = "$STAMP" ]; then
   echo "[py] $OUT already built from this pin and lock (use --force to rebuild)"
@@ -38,15 +38,16 @@ echo "[py] installing backend deps from the hash lock"
 # missing). requirements.in also names those three explicitly, belt-and-braces.
 # --require-hashes refuses any file whose bytes differ from the lock, and
 # --only-binary keeps a source package's build script from running here.
-"$OUT/bin/python3" -I -m pip install -q --disable-pip-version-check --isolated \
-    --no-cache-dir --require-hashes --only-binary=:all: -r "$LOCK"
+"$OUT/bin/python3" -I -B -m pip install -q --disable-pip-version-check --isolated \
+    --no-cache-dir --no-compile --require-hashes --only-binary=:all: -r "$LOCK"
 
 # Trim build fat (tests, caches) to shrink the bundle.
-find "$OUT/lib" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+find "$OUT" -type d -name "__pycache__" -prune -exec rm -rf {} +
+find "$OUT" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 find "$OUT/lib" -type d -name "test" -path "*/python3.12/test" -exec rm -rf {} + 2>/dev/null || true
 
 echo "[py] verifying Kokoro loads from the bundled runtime"
-"$OUT/bin/python3" -I -c "import kokoro_onnx, onnxruntime, fastapi, soundfile; print('ok', kokoro_onnx.__file__)"
+"$OUT/bin/python3" -I -B -c "import kokoro_onnx, onnxruntime, fastapi, soundfile; print('ok', kokoro_onnx.__file__)"
 # Stamp last, so a failed install never looks cached.
 printf '%s\n' "$STAMP" > "$OUT/.yap-runtime-stamp"
 echo "[py] done -> $OUT ($(du -sh "$OUT" | cut -f1))"

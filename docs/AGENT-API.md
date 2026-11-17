@@ -37,15 +37,15 @@ reports it as `api_version`. A breaking change to a route or field bumps it.
     discarded then.
   - The text goes back to the caller. It is pasted at the cursor only when the
     request says `"insert": true`.
-- **Two preferences control it.** `agentAPIEnabled` (default on) runs the
+- **Two preferences control it.** `agentAPIEnabled` (default off) runs the
   server at all; switching it off removes the socket immediately.
   `agentListenEnabled` (default off) allows `/listen`. Both are switches in
   **Settings ▸ Agents** (*Let agents use Yap*, *Allow agents to listen*).
-- **What lands on disk.** Text an agent has Yap speak, and words it has Yap hear,
-  appear in History like any other read or dictation, marked as the agent's
+- **What lands on disk.** With history recording enabled, text an agent has Yap
+  speak and words it has Yap hear appear in History, marked as the agent's
   ("agent" on a read, "Agent API" on a dictation, with the app it was pasted
   into when it was), so you can see what your agents had Yap say and hear.
-  Audio is never saved.
+  History recording is off by default. The history file stores text.
 - **Nothing leaves the machine.** The socket is a file. The API makes no network
   call and adds none (see `PRIVACY.md`).
 
@@ -95,8 +95,7 @@ The voices the menu offers. `id` is `engine:voice`, the form `/speak` accepts.
    "group":"American English","available":true,"current":true}]}
 ```
 
-`available` is false for a voice that is listed but cannot speak yet (a cloned
-Pocket voice while cloning is not ready).
+`available` reports whether a listed voice is ready to use.
 
 ### `POST /speak`
 
@@ -104,7 +103,7 @@ Pocket voice while cloning is not ready).
 |---|---|
 | `text` | required, at most 200,000 characters |
 | `voice` | `am_puck` (current engine) or `kokoro:am_puck`; defaults to the user's voice |
-| `engine` | `kokoro` or `pocket`; defaults to the user's engine |
+| `engine` | `kokoro` in this evaluation (the default) |
 | `speed` | 0.25 to 4; defaults to the user's speed |
 | `interrupt` | default `true`: replace what is playing and empty the line. `false`: wait your turn (up to 20 waiting) |
 | `clean` | default `true`: the normal cleanup (links, markdown, your custom rules). `false`: speak the text as written |

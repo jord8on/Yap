@@ -1,0 +1,53 @@
+{
+  "date": "2026-11-17",
+  "upstream_sha": "6b9375f99f0ece993bedbf10cbbe4662c1c0f02b",
+  "scope": "Preparation evidence, not release approval",
+  "source_policy": {
+    "result": "passed",
+    "tests": 9,
+    "environment": "macOS; stdlib source parsing and in-memory mutation checks only",
+    "command": "python3 -I -B tests/security_static/test_policy.py",
+    "checker_sha256": "99e03b12618783e2043a1750aece348c9188396dfc9c12dea644f98227e7fae2",
+    "application_execution": false
+  },
+  "tls_identity_unit_tests": {
+    "result": "passed",
+    "tests": 9,
+    "environment": "assistant isolated Linux container, Python 3.13.5, pytest 9.0.2",
+    "files_sha256": {
+      "backend/local_tls.py": "261ca78e5252591edb325b97133a0b6b6cce75657961812d6452556752383fb5",
+      "backend/tests/test_local_tls.py": "586817210b35580eeb6f172f14fc3396a70fdbba7ef722bfffb2f818bc924aa3"
+    },
+    "command": "PYTHONPATH=backend PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -B -m pytest -v -ra -p no:cacheprovider backend/tests/test_local_tls.py",
+    "scope": "Private identity creation, permissions, symlink refusal, concurrent creation, mismatched pair rejection; not Swift TLS or packaged runtime testing"
+  },
+  "review": {
+    "implementation_workers": 3,
+    "separate_read_only_reviewer": true,
+    "findings_fixed": [
+      "Explicit approved PR-label test trigger instead of inaccessible dispatch-only workflow",
+      "Allowlisted actual child environment excluding unrelated credentials and trust overrides",
+      "Private test_tts identity and restored globals",
+      "Existing user-owned regular history restricted before loading without rewriting bytes"
+    ],
+    "open": [
+      "P2 interrupted first TLS identity publication can leave a partial pair; startup fails closed; atomic pair publication remains daily-use blocker"
+    ]
+  },
+  "not_run": [
+    "Swift compile and XCTest",
+    "full backend suite",
+    "hosted macOS build",
+    "fresh advisory/native provenance scan",
+    "model egress",
+    "interactive mic/Accessibility/history/agent UI",
+    "notarization and distribution acceptance"
+  ],
+  "not_performed": [
+    "Yap installation or launch on primary Mac",
+    "Gatekeeper/security override",
+    "personal keychain changes",
+    "merge",
+    "release/deployment"
+  ]
+}

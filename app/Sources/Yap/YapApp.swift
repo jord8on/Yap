@@ -12,6 +12,8 @@ import SwiftUI
 @main
 enum YapMain {
     static func main() {
+        ModelNetworkPolicy.apply()
+
         if let i = CommandLine.arguments.firstIndex(of: "--pipetest") {
             let path = CommandLine.arguments.count > i + 1 ? CommandLine.arguments[i + 1] : ""
             let prof = CommandLine.arguments.count > i + 2 ? CommandLine.arguments[i + 2] : nil

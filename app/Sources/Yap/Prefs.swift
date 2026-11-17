@@ -76,10 +76,14 @@ struct HotKeyCombo: Codable, Equatable {
 /// App-wide preferences, UserDefaults backed, observable for SwiftUI.
 @MainActor
 final class Prefs: ObservableObject {
-    static let shared = Prefs()
-    private let d = UserDefaults.standard
+    static let shared: Prefs = {
+        // Import pre-rename settings before applying the new consent defaults.
+        AppMigration.runOnce()
+        return Prefs(defaults: .standard)
+    }()
+    private let d: UserDefaults
 
-    @Published var engine: String { didSet { d.set(engine, forKey: "engine") } }   // "kokoro" | "pocket"
+    @Published private(set) var engine: String { didSet { d.set(engine, forKey: "engine") } }
     @Published var voice: String { didSet { d.set(voice, forKey: "voice") } }
     @Published var hdVoice: String { didSet { d.set(hdVoice, forKey: "hdVoice") } } // pocket catalog name or cloned ref id
     @Published var speed: Double { didSet { d.set(speed, forKey: "speed") } }
@@ -100,9 +104,10 @@ final class Prefs: ObservableObject {
     @Published var failChime: Bool { didSet { d.set(failChime, forKey: "failChime") } }
     // Master feature switches: turn the read-aloud ("voice") or dictation ("ears")
     // feature off entirely. When off, that feature's global hot key is unregistered
-    // so it can't fire by accident. Default on.
+    // so it can't fire by accident. Reading is on and dictation is opt-in.
     @Published var voiceEnabled: Bool { didSet { d.set(voiceEnabled, forKey: "voiceEnabled") } }
     @Published var dictationEnabled: Bool { didSet { d.set(dictationEnabled, forKey: "dictationEnabled") } }
+    @Published var autoStartVoice: Bool { didSet { d.set(autoStartVoice, forKey: "autoStartVoice") } }
     // Master mute: silence every audible cue (read-fail, HD buffer, dictation
     // start/stop) in one switch, regardless of the individual chime toggles.
     @Published var muteAllSounds: Bool { didSet { d.set(muteAllSounds, forKey: "muteAllSounds") } }
@@ -115,18 +120,18 @@ final class Prefs: ObservableObject {
     @Published var dictationChime: Bool { didSet { d.set(dictationChime, forKey: "dictationChime") } }       // play a start/stop sound
     @Published var removeFillers: Bool { didSet { d.set(removeFillers, forKey: "removeFillers") } }           // strip "um"/"uh" from dictation
     // Once/day Yap asks GitHub for the latest release version (no payload, no
-    // identifiers — see UpdateChecker / PRIVACY). Default on. Off stops update
-    // checks only: launch-time model downloads (dictation, Pocket) are separate.
+    // identifiers — see UpdateChecker / PRIVACY). Automatic checks are opt-in.
     @Published var autoUpdateCheck: Bool { didSet { d.set(autoUpdateCheck, forKey: "autoUpdateCheck") } }
-    // The agent API (docs/AGENT-API.md): a Unix-domain socket other programs on
-    // this Mac use to speak through Yap and, separately, to listen. The API is on
-    // by default; turning it off stops the socket server live. LISTENING is a
-    // second, off-by-default switch: through the API any process running as you
-    // can use Yap's Microphone grant, which skips macOS's own prompt for that
-    // process, so the user opts in on purpose. No Settings control yet; the Agents
-    // pane binds to these two keys.
+    // Saving full transcripts and exposing the agent socket each require opt-in.
+    @Published var historyEnabled: Bool { didSet { d.set(historyEnabled, forKey: "historyEnabled") } }
     @Published var agentAPIEnabled: Bool { didSet { d.set(agentAPIEnabled, forKey: "agentAPIEnabled") } }
+    // Delegated listening can use Yap's microphone permission and is a separate opt-in.
     @Published var agentListenEnabled: Bool { didSet { d.set(agentListenEnabled, forKey: "agentListenEnabled") } }
+
+    func selectEngine(_ selection: String) {
+        guard EvaluationPolicy.allowsEngine(selection), selection != engine else { return }
+        engine = selection
+    }
 
     /// Last time an update check actually ran (throttles the once/day auto-check).
     /// Not @Published — nothing observes it; it only gates the timer.
@@ -151,15 +156,11 @@ final class Prefs: ObservableObject {
         }
     }
 
-    private init() {
-        // Port pre-rename state (Parley → Yap) before reading any setting below, so
-        // the new bundle-id domain has the user's real prefs, not fresh defaults.
-        AppMigration.runOnce()
-        // Pocket TTS replaced the Chatterbox engine. Existing users stored
-        // "chatterbox" but won't have Pocket installed yet, so fall back to the
-        // always-present Kokoro default; they re-install Pocket from Settings ▸ Voices.
+    init(defaults: UserDefaults) {
+        d = defaults
+        AppMigration.migrateHardenedPrivacy(in: defaults)
         let storedEngine = d.string(forKey: "engine") ?? "kokoro"
-        engine = (storedEngine == "chatterbox") ? "kokoro" : storedEngine
+        engine = EvaluationPolicy.allowsEngine(storedEngine) ? storedEngine : "kokoro"
         voice = d.string(forKey: "voice") ?? "am_puck"
         hdVoice = d.string(forKey: "hdVoice") ?? ""
         speed = d.object(forKey: "speed") as? Double ?? 1.0
@@ -170,18 +171,20 @@ final class Prefs: ObservableObject {
         captureMode = CaptureMode(rawValue: d.string(forKey: "captureMode") ?? "") ?? .clipboard
         readSource = ReadSource(rawValue: d.string(forKey: "readSource") ?? "") ?? .selection
         stopOnNewTrigger = d.object(forKey: "stopOnNewTrigger") as? Bool ?? true
-        autoLoadHD = d.object(forKey: "autoLoadHD") as? Bool ?? true
+        autoLoadHD = EvaluationPolicy.pocketEnabled && (d.object(forKey: "autoLoadHD") as? Bool ?? true)
         failChime = d.object(forKey: "failChime") as? Bool ?? true
         voiceEnabled = d.object(forKey: "voiceEnabled") as? Bool ?? true
-        dictationEnabled = d.object(forKey: "dictationEnabled") as? Bool ?? true
+        dictationEnabled = d.bool(forKey: "dictationEnabled")
+        autoStartVoice = d.bool(forKey: "autoStartVoice")
         muteAllSounds = d.object(forKey: "muteAllSounds") as? Bool ?? false
         providerMode = d.string(forKey: "providerMode") ?? "auto"
         dictationEngine = d.string(forKey: "dictationEngine") ?? "english"
         dictationChime = d.object(forKey: "dictationChime") as? Bool ?? true
         removeFillers = d.object(forKey: "removeFillers") as? Bool ?? true
-        autoUpdateCheck = d.object(forKey: "autoUpdateCheck") as? Bool ?? true
-        agentAPIEnabled = d.object(forKey: "agentAPIEnabled") as? Bool ?? true
-        agentListenEnabled = d.object(forKey: "agentListenEnabled") as? Bool ?? false
+        autoUpdateCheck = d.bool(forKey: "autoUpdateCheck")
+        historyEnabled = d.bool(forKey: "historyEnabled")
+        agentAPIEnabled = d.bool(forKey: "agentAPIEnabled")
+        agentListenEnabled = d.bool(forKey: "agentListenEnabled")
         launchAtLogin = d.object(forKey: "launchAtLogin") as? Bool ?? false
         if let data = d.data(forKey: "customRules"),
            let r = try? JSONDecoder().decode([CleanRule].self, from: data) {

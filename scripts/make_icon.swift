@@ -1,5 +1,6 @@
 #!/usr/bin/env swift
-// Renders Yap's app icon to app/Resources/AppIcon.icns (+ a 1024 preview PNG).
+// Renders Yap's iconset and a 1024 preview PNG. Pass a staging directory
+// to render only the iconset for packaging.
 // Apple-style rounded-square tile in the brand gradient, with the Yap mark: a
 // speech bubble whose face has a waveform for a mouth.
 // Run: swift scripts/make_icon.swift
@@ -7,10 +8,10 @@ import AppKit
 
 let repoRoot = URL(fileURLWithPath: CommandLine.arguments.first ?? "")
     .deletingLastPathComponent().deletingLastPathComponent()
+let staging = CommandLine.arguments.dropFirst().first.map { URL(fileURLWithPath: $0, isDirectory: true) }
 let resDir = repoRoot.appending(path: "app/Resources")
-let iconset = repoRoot.appending(path: "dist/AppIcon.iconset")
-try? FileManager.default.createDirectory(at: iconset, withIntermediateDirectories: true)
-try? FileManager.default.createDirectory(at: resDir, withIntermediateDirectories: true)
+let iconset = (staging ?? repoRoot.appending(path: "dist")).appending(path: "AppIcon.iconset")
+try FileManager.default.createDirectory(at: iconset, withIntermediateDirectories: true)
 
 func render(_ px: Int) -> Data {
     let s = CGFloat(px)
@@ -141,6 +142,8 @@ let members: [(String, Int)] = [
 for (name, px) in members {
     try! render(px).write(to: iconset.appending(path: "\(name).png"))
 }
-// Preview PNG for docs.
-try! render(1024).write(to: resDir.appending(path: "icon-1024.png"))
-print("rendered iconset + icon-1024.png")
+if staging == nil {
+    try FileManager.default.createDirectory(at: resDir, withIntermediateDirectories: true)
+    try render(1024).write(to: resDir.appending(path: "icon-1024.png"))
+    print("rendered iconset + icon-1024.png")
+}

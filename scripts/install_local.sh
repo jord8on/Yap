@@ -22,6 +22,11 @@
 # Never bumps the version — that's a release-only step (see AGENTS.md).
 set -euo pipefail
 
+if [ "${YAP_BUILD_SIGNING_MODE:-}" = evaluation ]; then
+  echo "[install] evaluation builds are limited to workflow evidence" >&2
+  exit 1
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="$ROOT/dist/Yap.app"
 DEST="/Applications/Yap.app"
@@ -40,6 +45,7 @@ if [ "${1:-}" != "--no-build" ]; then
   bash "$ROOT/scripts/build_app.sh"
 fi
 [ -d "$SRC" ] || { echo "[install] ERROR: $SRC missing — build first." >&2; exit 1; }
+codesign --verify --deep --strict "$SRC"
 
 # 2. Quit every running Yap instance. SIGTERM first so applicationWillTerminate
 #    stops its backend; escalate to SIGKILL only if it refuses to exit.
@@ -82,7 +88,7 @@ fi
 
 # 5. Install the fresh bundle and register it.
 echo "[install] installing $SRC -> $DEST"
-ditto "$SRC" "$DEST"
+ditto --extattr --qtn "$SRC" "$DEST"
 "$LSREGISTER" -f "$DEST" >/dev/null 2>&1 || true
 
 # 6. Launch — nothing is running now, so this launches the NEW binary.

@@ -767,10 +767,18 @@ class TestKeepAlive:
         fake = types.ModuleType("uvicorn")
         fake.run = lambda app, **kw: seen.update(kw)
         monkeypatch.setitem(sys.modules, "uvicorn", fake)
+        identity = tmp_path / "identity"
+        identity.mkdir(mode=0o700)
+        monkeypatch.setenv("YAP_AUTH_TOKEN_FILE", str(identity / "auth-token"))
+        # main mutates these globals; pytest restores them after this fixture.
+        monkeypatch.setattr(server, "AUTH_TOKEN", server.AUTH_TOKEN)
+        monkeypatch.setattr(server, "engine", server.engine)
         monkeypatch.setattr(sys, "argv",
-                            ["server.py", "--no-preload", "--models-dir", str(tmp_path)])
+                            ["server.py", "--no-preload", "--models-dir", str(tmp_path / "models")])
         server.main()
         assert seen.get("timeout_keep_alive") == server.KEEP_ALIVE
+        assert Path(seen["ssl_certfile"]).parent == identity
+        assert Path(seen["ssl_keyfile"]).parent == identity
 
 
 # ── stream integrity ────────────────────────────────────────────────────────

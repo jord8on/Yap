@@ -1,0 +1,171 @@
+name: Isolated macOS hardening evaluation
+
+on:
+  pull_request:
+    types: [labeled]
+    branches: [security/upstream-baseline-20261117]
+  workflow_dispatch:
+    inputs:
+      run_isolated_evaluation:
+        description: Build and run focused tests on a disposable GitHub-hosted macOS runner
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  evaluation:
+    if: >-
+      github.repository == 'jord8on/Yap' &&
+      ((github.event_name == 'workflow_dispatch' && inputs.run_isolated_evaluation) ||
+       (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
+        github.event.label.name == 'run-isolated-evaluation' &&
+        github.actor == github.repository_owner &&
+        github.event.pull_request.head.repo.full_name == github.repository))
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      EVALUATION_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      YAP_EVALUATION_APPROVED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      YAP_BUILD_SIGNING_MODE: evaluation
+      PARLEY_BUNDLE_PYTHON: "1"
+    steps:
+      - name: Start evaluation receipt
+        shell: bash
+        run: |
+          RECEIPTS="$RUNNER_TEMP/yap-evaluation-receipts"
+          printf 'RECEIPTS=%s\n' "$RECEIPTS" >> "$GITHUB_ENV"
+          mkdir -p "$RECEIPTS"
+          printf 'checkout_target=%s\nevent=%s\nrunner=%s\n' \
+            "$EVALUATION_SHA" "$GITHUB_EVENT_NAME" "$RUNNER_ENVIRONMENT" > "$RECEIPTS/source.txt"
+          printf '%s\n' 'Development signature and synthetic tests only. Advisory/code/secret scans, full native inventory, model pins and egress, interactive permissions/UI, and release verification were not run.' >> "$RECEIPTS/source.txt"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # verified v4 commit
+        with:
+          ref: ${{ env.EVALUATION_SHA }}
+          persist-credentials: false
+      - name: Record source, operating system, toolchain and lock digests
+        shell: bash
+        id: host
+        run: |
+          set -euo pipefail
+          {
+            actual="$(git rev-parse HEAD)"
+            printf 'source_sha=%s\n' "$actual"
+            test "$actual" = "$EVALUATION_SHA"
+            uname -a
+            sw_vers
+            xcodebuild -version
+            swift --version
+            /usr/bin/openssl version
+            shasum -a 256 app/Package.resolved scripts/python_pin.sh backend/requirements*.txt
+            test "$(uname -m)" = arm64
+          } 2>&1 | tee "$RECEIPTS/host.log"
+      - name: Compare Python locks with their inputs
+        shell: bash
+        id: lock_inputs
+        run: |
+          set -euo pipefail
+          bash -x scripts/lock_python_deps.sh --check 2>&1 | tee "$RECEIPTS/lock-inputs.log"
+      - name: Build application and pinned Python environment
+        if: ${{ !cancelled() && steps.host.outcome == 'success' }}
+        shell: bash
+        id: build
+        run: |
+          set -euo pipefail
+          {
+            set -x
+            bash scripts/build_app.sh release
+            dist/Yap.app/Contents/Resources/python/bin/python3 -I -B --version
+            shasum -a 256 dist/Yap.app/Contents/MacOS/Yap dist/Yap.app/Contents/Resources/python/bin/python3
+            codesign --verify --deep --strict --verbose=2 dist/Yap.app
+          } 2>&1 | tee "$RECEIPTS/build.log"
+      - name: Run Python token and TLS regressions
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        shell: bash
+        id: python
+        run: |
+          set -euo pipefail
+          {
+            scratch="$(mktemp -d "$RUNNER_TEMP/yap-python-tests.XXXXXX")"
+            unset YAP_AUTH_TOKEN
+            export YAP_AUTH_TOKEN_FILE="$scratch/auth-token"
+            py="$GITHUB_WORKSPACE/dist/python-runtime/bin/python3"
+            set -x
+            # These pinned test tools live outside the runtime and shipped locks.
+            "$py" -I -B -m pip install --isolated --disable-pip-version-check \
+              --no-cache-dir --no-compile --only-binary=:all: --no-deps --target "$scratch/tools" \
+              pytest==9.0.2 iniconfig==2.1.0 pluggy==1.6.0 pygments==2.19.2
+            cd backend
+            PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$scratch/tools" "$py" -s -B -m pytest \
+              -v -ra -p no:cacheprovider tests/test_auth.py tests/test_local_tls.py
+          } 2>&1 | tee "$RECEIPTS/python-tests.log"
+      - name: Run Swift TLS, history and model network regressions
+        if: ${{ !cancelled() && steps.host.outcome == 'success' }}
+        shell: bash
+        id: swift
+        run: |
+          set -euo pipefail
+          scratch="$(mktemp -d "$RUNNER_TEMP/yap-swift-tests.XXXXXX")"
+          export CFFIXED_USER_HOME="$scratch" YAP_HISTORY_FILE="$scratch/history.json"
+          suites=(BackendAuthenticationTests BackendManagerRecoveryTests EvaluationPolicyTests
+                  HistoryOptInTests ModelNetworkPolicyTests PrivacyMigrationTests)
+          filter="$(IFS='|'; printf '%s' "${suites[*]}")"
+          {
+            set -x
+            swift test --package-path app --disable-automatic-resolution \
+              --filter "$filter"
+          } 2>&1 | tee "$RECEIPTS/swift-tests.log"
+          for suite in "${suites[@]}"; do
+            grep -F "Test Suite '$suite' passed" "$RECEIPTS/swift-tests.log"
+          done
+          if grep -Eq "Test Case .* skipped" "$RECEIPTS/swift-tests.log"; then
+            echo "A focused XCTest case was skipped" >&2
+            exit 1
+          fi
+      - name: Exercise packaged HTTPS sidecar
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        shell: bash
+        id: packaged_tls
+        run: |
+          set -euo pipefail
+          bash scripts/ci/test-packaged-local-tls.sh 2>&1 | tee "$RECEIPTS/packaged-tls.log"
+      - name: Check development bundle after sidecar smoke test
+        if: always() && steps.build.outcome == 'success'
+        shell: bash
+        id: seal
+        run: |
+          set -euo pipefail
+          find dist/Yap.app \( -name '__pycache__' -o -name '*.pyc' -o -name '*.pyo' \) \
+            -print > "$RECEIPTS/bytecode.log" 2>&1
+          if [ -s "$RECEIPTS/bytecode.log" ]; then
+            cat "$RECEIPTS/bytecode.log" >&2
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=2 dist/Yap.app 2>&1 | tee "$RECEIPTS/seal.log"
+          git diff --exit-code -- app/Package.resolved scripts/python_pin.sh 'backend/requirements*.txt'
+      - name: Record outcomes
+        if: always()
+        shell: bash
+        env:
+          STATUS: ${{ job.status }}
+          HOST: ${{ steps.host.outcome }}
+          LOCK_INPUTS: ${{ steps.lock_inputs.outcome }}
+          BUILD: ${{ steps.build.outcome }}
+          PYTHON_TESTS: ${{ steps.python.outcome }}
+          SWIFT_TESTS: ${{ steps.swift.outcome }}
+          PACKAGED_TLS: ${{ steps.packaged_tls.outcome }}
+          SEAL: ${{ steps.seal.outcome }}
+        run: |
+          printf '%s\n' "job=$STATUS" "host=$HOST" "lock_inputs=$LOCK_INPUTS" "build=$BUILD" \
+            "python_tests=$PYTHON_TESTS" "swift_tests=$SWIFT_TESTS" \
+            "packaged_tls=$PACKAGED_TLS" "development_bundle_seal=$SEAL" >> "$RECEIPTS/source.txt"
+      - name: Upload evaluation receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: yap-evaluation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.RECEIPTS }}
+          if-no-files-found: error
+          retention-days: 7

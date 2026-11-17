@@ -11,10 +11,23 @@ import Foundation
 enum AppMigration {
     private static let oldBundleID = "dev.latentvariable.parley"
     private static let migratedKey = "didMigrateFromParley"
+    private static let privacyVersionKey = "hardenedPrivacyVersion"
+    private static let privacyVersion = 1
 
     static func runOnce() {
         migrateDefaults()
         migrateAppSupport()
+    }
+
+    /// Legacy values predate this consent prompt. Stamp the version only after
+    /// resetting the switches so later explicit choices survive subsequent launches.
+    static func migrateHardenedPrivacy(in defaults: UserDefaults) {
+        guard defaults.integer(forKey: privacyVersionKey) < privacyVersion else { return }
+        for key in ["historyEnabled", "agentAPIEnabled", "agentListenEnabled",
+                    "autoUpdateCheck", "dictationEnabled", "autoStartVoice"] {
+            defaults.set(false, forKey: key)
+        }
+        defaults.set(privacyVersion, forKey: privacyVersionKey)
     }
 
     /// Copy the old bundle-id's settings into the new domain, exactly once. A flag

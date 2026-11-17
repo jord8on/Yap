@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Sign + notarize Yap for friction-free distribution (double-click to open,
-# no "damaged"/"unidentified developer" warnings).
+# Sign and submit a release candidate for Apple notarization.
 #
 # Requires a paid Apple Developer account ($99/yr) and, one time:
 #   1. A "Developer ID Application" certificate in your keychain.
@@ -11,36 +10,26 @@
 # Then: bash scripts/notarize.sh "Developer ID Application: Your Name (TEAMID)"
 set -euo pipefail
 
+if [ "${YAP_BUILD_SIGNING_MODE:-}" = evaluation ]; then
+  echo "[notarize] evaluation builds are limited to workflow evidence" >&2
+  exit 1
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IDENTITY="${1:?pass the Developer ID Application identity}"
 PROFILE="${YAP_NOTARY_PROFILE:-${PARLEY_NOTARY_PROFILE:-yap-notary}}"
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$ROOT/app/Resources/Info.plist")"
-APP="$ROOT/dist/Yap.app"
 DMG="$ROOT/dist/Yap-$VERSION.dmg"
 
-echo "[notarize] building app (with bundled Python)"
-bash "$ROOT/scripts/build_app.sh" release >/dev/null
-
-echo "[notarize] signing with hardened runtime: $IDENTITY"
-# Sign nested code first (Python dylibs/binaries), then the app, with the
-# hardened runtime + a timestamp — both required for notarization.
-# Don't suppress codesign errors — a silent signing failure here surfaces much
-# later as an opaque notarization rejection.
-find "$APP/Contents/Resources/python" -type f \( -name "*.dylib" -o -name "*.so" -o -perm -111 \) \
-  -exec codesign --force --timestamp --options runtime --sign "$IDENTITY" {} +
-codesign --force --deep --timestamp --options runtime --sign "$IDENTITY" "$APP"
-codesign --verify --deep --strict "$APP" && echo "[notarize] signature OK"
+echo "[notarize] building and Developer ID signing app with bundled Python"
+YAP_BUILD_SIGNING_MODE=developer-id YAP_DEVELOPER_ID="$IDENTITY" PARLEY_BUNDLE_PYTHON=1 \
+  bash "$ROOT/scripts/build_app.sh" release
 
 echo "[notarize] packaging DMG"
-# --no-build is load-bearing: without it make_dmg.sh runs build_app.sh, which
-# rm -rf's dist/Yap.app and re-signs it ad-hoc, discarding the Developer ID
-# signature applied above and guaranteeing a notarization rejection.
+# Package the previously signed bundle to retain its Developer ID signature.
 bash "$ROOT/scripts/make_dmg.sh" "$VERSION" --no-build >/dev/null
 
-# Verify the bundle INSIDE the DMG, not $APP. Apple judges the copy that was
-# staged, xattr-stripped and compressed, and that copy is the whole reason this
-# step exists: make_dmg.sh used to rebuild over the signed bundle, and the only
-# symptom was an opaque rejection minutes later. Check the artifact, not a proxy.
+# Verify the bundle that will be submitted to Apple, inside the mounted DMG.
 MNT="$(mktemp -d)"
 hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MNT" >/dev/null
 # Detach on any exit, or a failed check leaves the volume mounted.
@@ -50,10 +39,11 @@ codesign --verify --deep --strict "$MNT/Yap.app" \
 # --deep --strict passes on an ad-hoc signature too, so also require that the
 # identity actually made it in. That is the failure #66 was: a correctly signed
 # bundle carrying the WRONG signature.
-codesign -dvv "$MNT/Yap.app" 2>&1 | grep -q "^Authority=Developer ID Application" \
-  || { echo "[notarize] the DMG's bundle is not Developer ID signed — make_dmg.sh rebuilt it" >&2
-       codesign -dvv "$MNT/Yap.app" 2>&1 | grep -E "^Authority=|^Signature=" >&2
-       exit 1; }
+SIGNATURE="$(codesign -dvv "$MNT/Yap.app" 2>&1)"
+if ! grep -q '^Authority=Developer ID Application:' <<< "$SIGNATURE"; then
+  echo "[notarize] the DMG's bundle lacks a Developer ID signature" >&2
+  exit 1
+fi
 # Detach BEFORE submitting: stapler writes the ticket into this DMG, and doing
 # that under a live read-only mount of the same file is asking for trouble. The
 # trap stays armed as a safety net for the failure paths above.
@@ -66,4 +56,5 @@ xcrun notarytool submit "$DMG" --keychain-profile "$PROFILE" --wait
 
 echo "[notarize] stapling ticket"
 xcrun stapler staple "$DMG"
-xcrun stapler validate "$DMG" && echo "[notarize] done -> $DMG (notarized, double-click installable)"
+xcrun stapler validate "$DMG"
+echo "[notarize] done -> $DMG (stapled ticket validated)"

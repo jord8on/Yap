@@ -14,15 +14,9 @@ https://github.com/user-attachments/assets/8fae0d41-6e23-4b7c-8de5-03618614a30b
 
 </div>
 
-## Install
+## Hardening evaluation
 
-```bash
-brew install --cask latent-variable/tap/yap
-```
-
-Or grab `Yap-*.dmg` from [Releases](https://github.com/latent-variable/Yap/releases), drag it to Applications, and run `xattr -cr /Applications/Yap.app` once (it's open source, not notarized). Or build it: `git clone https://github.com/latent-variable/Yap.git && cd Yap && bash scripts/build_app.sh && open dist/Yap.app`.
-
-First launch: Yap downloads the Kokoro voice (~340 MB) on its own; grant Microphone and Accessibility when asked. The app bundles its own Python, so there is nothing else to install.
+This checkout is for source evaluation. Do not install it on a primary Mac or bypass Gatekeeper. The isolated workflow, supported features, and release gates are documented in [Hardening evaluation](docs/hardening/EVALUATION.md).
 
 ## How you use it
 
@@ -36,8 +30,8 @@ First launch: Yap downloads the Kokoro voice (~340 MB) on its own; grant Microph
 
 Both shortcuts can be any chord, including a modifier-only one like ⌥⌘ held and released.
 
-- **Dictation** runs NVIDIA Parakeet on the Apple Neural Engine: a fast streaming model for the live preview, an accurate one for the text it inserts. English, or 25 languages in multilingual mode. Your last 500 dictations are kept in Settings ▸ History, so a missed paste can be copied again.
-- **Two voice engines.** Kokoro: 54 voices in 8 languages, instant, on CPU. Pocket TTS (optional): 26 more natural voices, and **voice cloning** from a 20-second clip.
+- **Dictation** runs NVIDIA Parakeet on the Apple Neural Engine, with a fast streaming model for the live preview and a more accurate model for the final text. Use English or multilingual mode. Settings ▸ History can save up to 500 dictations and 500 reads when you enable recording.
+- **Kokoro** provides 54 voices in 8 languages on CPU. Pocket TTS and voice cloning are disabled in the evaluation.
 - **Cleanup before it speaks.** Markdown, code blocks, citations and URLs are stripped so you hear the words, not the punctuation.
 
 Yap is a free alternative to the dictation features of [Wispr Flow Pro](https://wisprflow.ai/pricing), [Superwhisper Pro](https://ai.superwhisper.com/) and [MacWhisper Pro](https://goodsnooze.gumroad.com/l/macwhisper), and it reads aloud too.
@@ -65,7 +59,7 @@ The same block, plus a simpler version, is in **Settings ▸ Agents** with a Cop
 
 ### Let agents speak and listen on their own
 
-Yap also answers a small local API, so an agent, a script or a desktop companion can use the same voice and ears without you pressing anything:
+Yap offers an opt-in local API for agents, scripts, and desktop companions. The API and microphone access through it have separate switches in Settings ▸ Agents.
 
 ```bash
 ln -s /Applications/Yap.app/Contents/Resources/bin/yap /usr/local/bin/yap   # once
@@ -77,29 +71,21 @@ It is HTTP over a private socket in `~/Library/Application Support/Yap`, so no w
 
 ## Privacy
 
-Everything runs on your Mac: no account, no telemetry, and your audio and text never leave it. **Accessibility** lets Yap read your selection and paste; **Microphone** feeds dictation. Don't want to grant Accessibility? Set **Read source** to Clipboard and copy text yourself.
+Speech synthesis and dictation run locally. **Accessibility** lets Yap read a selection and paste a transcript. **Microphone** feeds dictation. To read without granting Accessibility, set **Read source** to Clipboard and copy text yourself.
 
-Yap goes online only to download models (the Kokoro voice on first launch, the dictation pair at launch while Dictation is on, Pocket's files when it loads, and anything you start in Settings) and for automatic update checks at launch, throttled to at most once per 24 hours, that you can turn off. The full list is in [docs/PRIVACY.md](docs/PRIVACY.md).
-
-Don't take my word for it. Point your coding agent at this repo and have it confirm nothing about you leaves the machine. If it holds up, a ⭐ helps.
+Launch-time loading for Voice and Dictation is opt-in and can download missing models. Update checks are also opt-in and run at launch, at most once per 24 hours after a successful check. See [Privacy and permissions](docs/PRIVACY.md).
 
 > In terminals like iTerm, which don't expose their selection, **Auto** read source falls back to your clipboard. Highlighting there replaces what you'd copied, and pressing Read with nothing selected speaks the clipboard. Want strict selection only? Set **Read source** to Selected text.
 
 ## How it's built
 
 ```
-SwiftUI menu-bar app ──HTTP──> local FastAPI sidecar ──┬─ Kokoro (ONNX, CPU)
-  hotkeys · capture · cleanup · player                 └─ Pocket TTS (PyTorch, CPU)
+SwiftUI menu-bar app ──pinned HTTPS──> local FastAPI sidecar ──> Kokoro (ONNX, CPU)
+  hotkeys · capture · cleanup · player
   mic ──> FluidAudio · Parakeet (CoreML, Apple Neural Engine)   ← dictation, in-app
 ```
 
 The voice runs in a local Python sidecar on `127.0.0.1`; dictation runs inside the app. Module map: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-
-```bash
-bash scripts/build_app.sh && open dist/Yap.app                               # build + run
-cd app && swift build && "$(swift build --show-bin-path)/Yap" --selftest   # Swift tests
-cd backend && python -m pytest tests/ -q                                     # backend tests
-```
 
 ## License
 

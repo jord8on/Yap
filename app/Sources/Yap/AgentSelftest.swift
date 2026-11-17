@@ -178,14 +178,14 @@ enum AgentSelftest {
         ok("...even before the voice list has loaded", params(resolve(.init(), combined: [])) == "kokoro/am_puck/1.25")
         ok("a speed override changes only the speed", params(resolve(.init(speed: 2))) == "kokoro/am_puck/2.0")
         ok("a bare voice id uses the current engine", params(resolve(.init(voice: "af_heart"))) == "kokoro/af_heart/1.25")
-        ok("engine:voice names both", params(resolve(.init(voice: "pocket:eve"))) == "pocket/eve/1.25")
-        ok("an engine alone takes that engine's own voice", params(resolve(.init(engine: "pocket"))) == "pocket/eve/1.25")
+        ok("engine:voice names both", params(resolve(.init(voice: "kokoro:af_heart"))) == "kokoro/af_heart/1.25")
+        ok("an engine alone takes that engine's own voice", params(resolve(.init(engine: "kokoro"))) == "kokoro/am_puck/1.25")
         ok("a voice from the other engine is rejected",
            params(resolve(.init(engine: "kokoro", voice: "pocket:eve"))) == "400 bad_voice")
         ok("an unknown voice is rejected", params(resolve(.init(voice: "nobody"))) == "400 bad_voice")
         ok("an unknown engine prefix is rejected", params(resolve(.init(voice: "bark:x"))) == "400 bad_voice")
-        ok("Pocket is refused when it is not installed", params(resolve(.init(engine: "pocket"), hd: false)) == "400 engine_unavailable")
-        ok("a cloned voice that cannot speak yet is 409", params(resolve(.init(voice: "pocket:Philip"))) == "409 voice_unavailable")
+        ok("Pocket is disabled even when installed", params(resolve(.init(engine: "pocket"))) == "400 engine_unavailable")
+        ok("voice cloning is disabled", params(resolve(.init(voice: "pocket:Philip"))) == "400 engine_unavailable")
         ok("an override before the voice list loads is a retryable 503",
            params(resolve(.init(voice: "af_heart"), combined: [])) == "503 voices_not_loaded")
 

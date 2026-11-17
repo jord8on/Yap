@@ -2,6 +2,11 @@
 # Build Yap.app and wrap it in a compressed, drag-to-install DMG.
 set -euo pipefail
 
+if [ "${YAP_BUILD_SIGNING_MODE:-}" = evaluation ]; then
+  echo "[dmg] evaluation builds are limited to workflow evidence" >&2
+  exit 1
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION=""; BUILD=1
 while [ $# -gt 0 ]; do
@@ -21,7 +26,7 @@ VOL="Yap"
 
 # --no-build packages the bundle already sitting in dist/. notarize.sh needs it:
 # it signs dist/Yap.app with the Developer ID identity, and a rebuild here would
-# replace that bundle with a fresh ad-hoc/self-signed one, so the DMG submitted to
+# replace that bundle with a fresh local development build, so the DMG submitted to
 # Apple would carry the wrong signature and always fail notarization.
 if [ "$BUILD" = 1 ]; then
   echo "[dmg] building app bundle"
@@ -30,6 +35,7 @@ else
   echo "[dmg] --no-build: packaging the existing $APP"
   [ -d "$APP" ] || { echo "no app bundle at $APP — drop --no-build or build first" >&2; exit 1; }
 fi
+codesign --verify --deep --strict "$APP"
 
 echo "[dmg] staging"
 [[ "$STAGE" == "$ROOT/dist/dmg-stage" && "$DMG" == "$ROOT/dist/Yap-$VERSION.dmg" ]] || exit 1
@@ -37,10 +43,8 @@ for artifact in "$STAGE" "$DMG"; do
   if [ -e "$artifact" ]; then trash "$artifact"; fi
 done
 mkdir -p "$STAGE"
-cp -R "$APP" "$STAGE/"
+ditto --extattr --qtn "$APP" "$STAGE/Yap.app"
 ln -s /Applications "$STAGE/Applications"
-# strip quarantine so right-click-Open friction is minimal locally
-xattr -cr "$STAGE/Yap.app" 2>/dev/null || true
 
 echo "[dmg] creating compressed image"
 hdiutil create -volname "$VOL" -srcfolder "$STAGE" -ov -format UDZO -fs HFS+ "$DMG" >/dev/null

@@ -11,6 +11,7 @@ final class BackendManagerRecoveryTests: XCTestCase {
 
         child.executableURL = executable
         child.arguments = ["--backendrecoverytest", String(port)]
+        child.environment = ["PATH": "/usr/bin:/bin"]
         child.standardOutput = output
         child.standardError = output
         child.terminationHandler = { _ in finished.signal() }
@@ -29,6 +30,9 @@ final class BackendManagerRecoveryTests: XCTestCase {
 
     private func yapExecutable() throws -> URL {
         let fm = FileManager.default
+        let sibling = Bundle(for: Self.self).bundleURL.deletingLastPathComponent().appending(path: "Yap")
+        if fm.isExecutableFile(atPath: sibling.path) { return sibling }
+
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()

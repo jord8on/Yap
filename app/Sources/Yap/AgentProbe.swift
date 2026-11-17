@@ -66,24 +66,28 @@ enum AgentProbe {
             guard let sock = ProcessInfo.processInfo.environment["YAP_API_SOCKET"], !sock.isEmpty else {
                 print("set YAP_API_SOCKET to a socket path (in a private directory)"); exit(2)
             }
-            AppState.probeBackendPort = port
-            HistoryStore.probeFileURL = URL(fileURLWithPath: sock).deletingLastPathComponent().appending(path: "history.json")
-            let prefs = Prefs.shared
+            let suite = "dev.latentvariable.yap.apiserve.\(UUID().uuidString)"
+            guard let defaults = UserDefaults(suiteName: suite) else { exit(2) }
+            let prefs = Prefs(defaults: defaults)
             prefs.volume = 0
             prefs.muteAllSounds = true
-            let state = AppState.shared
+            prefs.agentAPIEnabled = true
+            let historyURL = FileManager.default.temporaryDirectory.appending(path: "\(suite).json")
+            let history = HistoryStore(fileURL: historyURL, recordingEnabled: { false })
+            let state = AppState(prefs: prefs, backendPort: port, history: history)
             await state.backend.start()
             guard state.backend.ready else { print("sidecar did not start: \(state.backend.lastError ?? "?")"); exit(1) }
             state.voices = await state.backend.client.voices()
-            let dictation = DictationController.shared
+            let dictation = DictationController(prefs: prefs, history: history)
             dictation.headless = true
             if let speechPath, let clip = try? DictationProbe.loadMicLike(speechPath) {
+                prefs.dictationEnabled = true
                 prefs.agentListenEnabled = true
                 dictation.simulatedCapture = simulatedFeeder(clip: clip, clipSeconds: Double(clip.frameLength) / clip.format.sampleRate, tail: 6)
             }
             let controller = AgentAPIController(state: state, dictation: dictation, prefs: prefs, socketPath: sock)
             served = controller   // the server holds the controller weakly; keep it alive
-            controller.start()
+            controller.bootstrap()
             print("serving on \(sock) (listen \(prefs.agentListenEnabled ? "on, hears \(speechPath ?? "")" : "off"))")
         }
         dispatchMain()
@@ -143,16 +147,19 @@ enum AgentProbe {
             sock = dir.appending(path: "yap.sock").path
 
             print("Agent API probe — own socket \(sock), own sidecar on :\(port)")
-            HistoryStore.probeFileURL = dir.appending(path: "history.json")
-            AppState.probeBackendPort = port
-            let prefs = Prefs.shared
+            let suite = "dev.latentvariable.yap.apitest.\(UUID().uuidString)"
+            guard let defaults = UserDefaults(suiteName: suite) else { return 2 }
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let prefs = Prefs(defaults: defaults)
             prefs.volume = 0
             prefs.muteAllSounds = true
-            prefs.engine = "kokoro"
             prefs.voice = "am_puck"
             prefs.speed = 1.0
-            prefs.agentAPIEnabled = true
+            prefs.historyEnabled = true
             prefs.agentListenEnabled = false
+            prefs.dictationEnabled = true
+            let history = HistoryStore(fileURL: dir.appending(path: "history.json"),
+                                       recordingEnabled: { prefs.historyEnabled })
             let baseline = (prefs.engine, prefs.voice, prefs.hdVoice, prefs.speed, prefs.pitch, prefs.volume)
 
             ok("YAP_API_SOCKET overrides the socket path",
@@ -160,7 +167,7 @@ enum AgentProbe {
             ok("the default path is in Application Support/Yap",
                AgentAPI.socketPath(env: [:]).hasSuffix("/Library/Application Support/Yap/yap.sock"))
 
-            let state = AppState.shared
+            let state = AppState(prefs: prefs, backendPort: port, history: history)
             guard state.backend.repoRoot() != nil else {
                 print("  ✗ no repo root: set YAP_REPO to the Yap checkout"); return 1
             }
@@ -172,7 +179,7 @@ enum AgentProbe {
             state.voices = await state.backend.client.voices()
             ok("kokoro voices loaded", !state.voices.isEmpty)
 
-            let dictation = DictationController.shared
+            let dictation = DictationController(prefs: prefs, history: history)
             dictation.headless = true
             // A tripwire, not a feature: until the listen section installs its file
             // feeder, anything that gets as far as opening the capture trips this
@@ -182,6 +189,8 @@ enum AgentProbe {
             dictation.simulatedCapture = { _ in self.micTouched = true; throw CancellationError() }
             let controller = AgentAPIController(state: state, dictation: dictation, prefs: prefs, socketPath: sock)
             controller.bootstrap()
+            ok("the API socket is absent before opt-in", !fm.fileExists(atPath: self.sock))
+            prefs.agentAPIEnabled = true
             ok("the server comes up", await until(2) { fm.fileExists(atPath: self.sock) })
 
             // MARK: the socket
@@ -234,8 +243,8 @@ enum AgentProbe {
             let fast = await fastTask.value
             ok("that read finished", fast.json["outcome"] as? String == "finished", fast.raw)
             ok("it spoke the requested voice (History says so)",
-               HistoryStore.shared.spoken.first?.detail.contains("af_heart") == true,
-               HistoryStore.shared.spoken.first?.detail ?? "none")
+               history.spoken.first?.detail.contains("af_heart") == true,
+               history.spoken.first?.detail ?? "none")
             state.readAloud("A normal read after an API read.")
             ok("the next ordinary read is back at the user's speed", await until(30) { state.status == .reading && state.audio.currentRate == Float(baseline.3) },
                "rate \(state.audio.currentRate)")
@@ -278,7 +287,7 @@ enum AgentProbe {
             let second = await call("POST", "/speak", #"{"text":"Second in line.","interrupt":false,"wait":true}"#)
             ok("a queued request plays after the one before it and reports finished",
                second.json["outcome"] as? String == "finished" && state.speakOutcome(Int(first.json["id"] as? String ?? "") ?? -1) == .finished, second.raw)
-            let order = HistoryStore.shared.spoken.prefix(2).map(\.text)
+            let order = history.spoken.prefix(2).map(\.text)
             ok("...in order", order.count == 2 && order[0].contains("Second") && order[1].contains("First"), "\(order)")
 
             // MARK: a caller that hangs up
@@ -296,12 +305,12 @@ enum AgentProbe {
             print("  the user's settings")
             let after = (prefs.engine, prefs.voice, prefs.hdVoice, prefs.speed, prefs.pitch, prefs.volume)
             ok("no request changed the user's engine, voice, speed, pitch or volume", after == baseline, "\(after)")
-            ok("...nor what is stored on disk", UserDefaults.standard.double(forKey: "speed") == 1.0
-               && UserDefaults.standard.string(forKey: "voice") == "am_puck",
-               "speed \(UserDefaults.standard.double(forKey: "speed")), voice \(UserDefaults.standard.string(forKey: "voice") ?? "nil")")
+            ok("...nor what is stored on disk", defaults.double(forKey: "speed") == 1.0
+               && defaults.string(forKey: "voice") == "am_puck",
+               "speed \(defaults.double(forKey: "speed")), voice \(defaults.string(forKey: "voice") ?? "nil")")
 
             // MARK: listen (simulated capture)
-            await listenChecks(dictation: dictation, prefs: prefs, dir: dir)
+            await listenChecks(dictation: dictation, prefs: prefs, history: history, dir: dir)
 
             // MARK: live toggle
             print("  the live switch")
@@ -321,7 +330,7 @@ enum AgentProbe {
 
         // MARK: - listen
 
-        func listenChecks(dictation: DictationController, prefs: Prefs, dir: URL) async {
+        func listenChecks(dictation: DictationController, prefs: Prefs, history: HistoryStore, dir: URL) async {
             print("  listen (speech from a file, no microphone)")
             let fm = FileManager.default
             let speech = dir.appending(path: "speech.aiff").path
@@ -362,7 +371,7 @@ enum AgentProbe {
             ok("...without pasting", l.json["inserted"] as? Bool == false)
             ok("...the mic is closed again", dictation.dictation.state == .idle && dictation.agentSession == nil)
             ok("...and it is in History as an agent dictation",
-               HistoryStore.shared.dictated.first?.detail == "Agent API" && HistoryStore.shared.dictated.first?.text.lowercased().contains("fox") == true)
+               history.dictated.first?.detail == "Agent API" && history.dictated.first?.text.lowercased().contains("fox") == true)
 
             let plain = await call("POST", "/listen", #"{"max_seconds":30,"silence_seconds":1.2}"#, accept: "text/plain")
             ok("Accept: text/plain returns just the words",
@@ -376,7 +385,7 @@ enum AgentProbe {
             let ins = await call("POST", "/listen", #"{"max_seconds":30,"silence_seconds":1.2,"insert":true}"#)
             ok("insert:true pastes the transcript",
                ins.json["inserted"] as? Bool == true && pastedText?.lowercased().contains("fox") == true, ins.raw)
-            let insDetail = HistoryStore.shared.dictated.first?.detail ?? ""
+            let insDetail = history.dictated.first?.detail ?? ""
             ok("...and History marks it as the agent's, not the user's", insDetail.hasPrefix("Agent API"), insDetail)
             dictation.simulatedPaste = nil
 

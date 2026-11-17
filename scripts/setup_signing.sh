@@ -11,6 +11,11 @@
 #   bash scripts/setup_signing.sh --remove   # undo
 set -euo pipefail
 
+if [ "${YAP_BUILD_SIGNING_MODE:-}" = evaluation ]; then
+  echo "[sign] evaluation signing does not use a local identity" >&2
+  exit 1
+fi
+
 NAME="Yap Local Signing"
 SIGN_KC="$HOME/Library/Keychains/yap-signing.keychain-db"
 KCPW="yap-local"   # password for THIS keychain only
@@ -65,7 +70,7 @@ openssl pkcs12 -export -inkey "$TMP/key.pem" -in "$TMP/cert.pem" -out "$TMP/id.p
   -passout pass:yap -name "$NAME" "${LEGACY_ARGS[@]}" >/dev/null 2>&1
 
 echo "[sign] importing + authorizing codesign (non-interactive)"
-security import "$TMP/id.p12" -k "$SIGN_KC" -P yap -T /usr/bin/codesign -A >/dev/null
+security import "$TMP/id.p12" -k "$SIGN_KC" -P yap -T /usr/bin/codesign >/dev/null
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCPW" "$SIGN_KC" >/dev/null 2>&1
 
 # add the signing keychain to the search list (keep existing ones)
@@ -84,9 +89,7 @@ if codesign --force --sign "$NAME" --keychain "$SIGN_KC" "$VTMP/echo" 2>/dev/nul
    && codesign -dvv "$VTMP/echo" 2>&1 | grep -q "Authority=$NAME"; then
   rm -rf "$VTMP"
   echo "✓ '$NAME' ready (dedicated keychain, no prompts)."
-  echo "  Rebuild + reinstall once, grant Accessibility once, and it sticks"
-  echo "  across every future build:"
-  echo "    bash scripts/build_app.sh && cp -R dist/Yap.app /Applications/"
+  echo "  Use this identity for local development builds outside evaluation."
 else
   rm -rf "$VTMP"
   echo "✗ setup failed — codesign could not use the identity."

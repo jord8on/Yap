@@ -7,28 +7,67 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APPDIR="$ROOT/app"
 CONFIG="${1:-release}"
 OUT="$ROOT/dist"
-APP="$OUT/Yap.app"
+DEST="$OUT/Yap.app"
+SIGNING_MODE="${YAP_BUILD_SIGNING_MODE:-local}"
+
+case "$SIGNING_MODE" in
+  local)
+    SIGN_ID="Yap Local Signing"
+    SIGN_KC="$HOME/Library/Keychains/yap-signing.keychain-db"
+    if [ ! -f "$SIGN_KC" ]; then
+      echo "[build] local signing keychain is missing" >&2
+      exit 1
+    fi
+    ;;
+  evaluation)
+    if [ "${GITHUB_ACTIONS:-}" != true ] || [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ] ||
+       [ -z "${YAP_EVALUATION_APPROVED_SHA:-}" ]; then
+      echo "[build] evaluation signing requires an explicitly approved GitHub-hosted run" >&2
+      exit 1
+    fi
+    case "${GITHUB_EVENT_NAME:-}" in
+      workflow_dispatch|pull_request) ;;
+      *) echo "[build] unsupported evaluation event" >&2; exit 1 ;;
+    esac
+    if [ "$(git -C "$ROOT" rev-parse HEAD)" != "$YAP_EVALUATION_APPROVED_SHA" ]; then
+      echo "[build] checkout does not match the explicitly approved source SHA" >&2
+      exit 1
+    fi
+    ;;
+  developer-id)
+    SIGN_ID="${YAP_DEVELOPER_ID:?Developer ID Application identity required}"
+    [[ "$SIGN_ID" == "Developer ID Application: "* ]] || exit 1
+    if [ "${PARLEY_BUNDLE_PYTHON:-1}" != 1 ]; then
+      echo "[build] Developer ID packaging requires the bundled Python runtime" >&2
+      exit 1
+    fi
+    ;;
+  *) echo "[build] unknown signing mode: $SIGNING_MODE" >&2; exit 2 ;;
+esac
 
 echo "[build] swift build -c $CONFIG"
-( cd "$APPDIR" && swift build -c "$CONFIG" )
-BIN="$(cd "$APPDIR" && swift build -c "$CONFIG" --show-bin-path)/Yap"
+( cd "$APPDIR" && swift build -c "$CONFIG" --disable-automatic-resolution )
+BIN="$(cd "$APPDIR" && swift build -c "$CONFIG" --disable-automatic-resolution --show-bin-path)/Yap"
 
+mkdir -p "$OUT"
+STAGE="$(mktemp -d "$OUT/.build-app.XXXXXX")"
+trap 'rm -rf "$STAGE"' EXIT
+APP="$STAGE/Yap.app"
 echo "[build] assembling $APP"
-[[ "$APP" == "$ROOT/dist/Yap.app" ]] || exit 1
-if [ -e "$APP" ]; then trash "$APP"; fi
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/repo"
 
 cp "$BIN" "$APP/Contents/MacOS/Yap"
 cp "$ROOT/app/Resources/Info.plist" "$APP/Contents/Info.plist"
 
 # App icon (regenerate if the generator is newer than the icns).
-if [ ! -f "$ROOT/app/Resources/AppIcon.icns" ] || \
-   [ "$ROOT/scripts/make_icon.swift" -nt "$ROOT/app/Resources/AppIcon.icns" ]; then
+ICON="$ROOT/app/Resources/AppIcon.icns"
+if [ ! -f "$ICON" ] || [ "$ROOT/scripts/make_icon.swift" -nt "$ICON" ]; then
   echo "[build] rendering app icon"
-  swift "$ROOT/scripts/make_icon.swift" >/dev/null
-  iconutil -c icns "$ROOT/dist/AppIcon.iconset" -o "$ROOT/app/Resources/AppIcon.icns"
+  swift "$ROOT/scripts/make_icon.swift" "$STAGE" >/dev/null
+  ICON="$STAGE/AppIcon.icns"
+  iconutil -c icns "$STAGE/AppIcon.iconset" -o "$ICON"
 fi
-cp "$ROOT/app/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"
 
 # Bundle the openly-licensed HD starter voices (CMU ARCTIC) so every install
 # has them out of the box; the app seeds them into Application Support on first
@@ -64,44 +103,28 @@ if [ "${PARLEY_BUNDLE_PYTHON:-1}" = "1" ]; then
   # are the ones it was built from.
   bash "$ROOT/scripts/bundle_python.sh"
   echo "[build] embedding Python runtime"
-  ditto "$ROOT/dist/python-runtime" "$APP/Contents/Resources/python"
+  ditto --extattr --qtn "$ROOT/dist/python-runtime" "$APP/Contents/Resources/python"
 fi
 
-# Prefer a stable self-signed identity. macOS ties the Accessibility (and Mic)
-# grant to the signature's DESIGNATED REQUIREMENT — i.e. the certificate —
-# instead of the binary's cdhash. So every rebuild keeps the same identity and
-# the grant survives. Ad-hoc signing (the fallback) is cdhash-bound, so each
-# rebuild looks like a brand-new app to TCC and the grant is lost — that's what
-# made axTrusted flap. Set the identity up once with scripts/setup_signing.sh.
-SIGN_ID="Yap Local Signing"
-SIGN_KC="$HOME/Library/Keychains/yap-signing.keychain-db"
-SIGN_KCPW="yap-local"
-if [ -f "$SIGN_KC" ] && security find-certificate -c "$SIGN_ID" "$SIGN_KC" >/dev/null 2>&1; then
-  echo "[build] signing with '$SIGN_ID' (stable identity — Accessibility grant persists)"
-  # codesign needs the key reachable non-interactively: just UNLOCK the keychain.
-  # Do NOT re-run set-key-partition-list here — that's a one-time setup step
-  # (setup_signing.sh), and re-applying it right before signing leaves codesign
-  # unable to reach the private key, silently yielding an ad-hoc signature (the
-  # exact bug that broke grant persistence). Unlock-then-sign is the working path.
-  security unlock-keychain -p "$SIGN_KCPW" "$SIGN_KC" 2>/dev/null || true
-  # Gate on codesign's OWN exit code, not a follow-up `codesign -dvv` read:
-  # codesign --sign <identity> either succeeds with that identity (exit 0) or
-  # errors (non-zero) — it never silently ad-hocs (only `--sign -` does that).
-  # A separate -dvv check can read a stale signature from the kernel's code-sign
-  # cache right after re-signing and false-negative, which is misleading.
-  CODESIGN_ERR="$(mktemp)"   # unique temp file — no predictable /tmp symlink target
-  if codesign --force --deep --sign "$SIGN_ID" --keychain "$SIGN_KC" "$APP" 2>"$CODESIGN_ERR"; then
-    echo "[build] signed with stable identity (Accessibility grant persists across rebuilds)"
-  else
-    echo "[build] ERROR: codesign with '$SIGN_ID' failed — grant will NOT persist:" >&2
-    sed 's/^/[build]   /' "$CODESIGN_ERR" >&2
-    echo "[build]        Re-run: bash scripts/setup_signing.sh   then rebuild." >&2
-    trash "$CODESIGN_ERR"; exit 1
-  fi
-  trash "$CODESIGN_ERR"
-else
-  echo "[build] ad-hoc signing (no stable identity; run scripts/setup_signing.sh)"
-  codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || echo "[build] codesign skipped"
-fi
+# Sign and verify the staged bundle before replacing the previous build.
+case "$SIGNING_MODE" in
+  local)
+    # Keep the stable designated requirement for local Accessibility grants.
+    security unlock-keychain -p yap-local "$SIGN_KC"
+    codesign --force --deep --sign "$SIGN_ID" --keychain "$SIGN_KC" "$APP"
+    ;;
+  evaluation)
+    echo "[build] ad-hoc signing for isolated evaluation"
+    codesign --force --deep --sign - "$APP"
+    ;;
+  developer-id)
+    find "$APP/Contents/Resources/python" -type f \( -name '*.dylib' -o -name '*.so' -o -perm -111 \) \
+      -exec codesign --force --timestamp --options runtime --sign "$SIGN_ID" {} +
+    codesign --force --deep --timestamp --options runtime --sign "$SIGN_ID" "$APP"
+    ;;
+esac
+codesign --verify --deep --strict "$APP"
 
-echo "[build] done -> $APP"
+if [ -e "$DEST" ]; then trash "$DEST"; fi
+mv "$APP" "$DEST"
+echo "[build] done -> $DEST"

@@ -1,50 +1,64 @@
-name: Security
+name: Hardening source checks
 
-# The security gate an agent runs before a merge (scripts/audit-deps.sh,
-# scripts/audit-code.sh), on a clean checkout of every pull request: known
-# vulnerable dependencies (OSV-Scanner), dangerous code in the changed files
-# (Semgrep) and secrets in the branch's commits (gitleaks). Seconds each.
-#
-# The Swift build and the probes are not here: they need macOS, a signed bundle
-# and real devices, and stay on the Mac. Yap is public, so this standard runner
-# spends no Actions minutes.
 on:
   pull_request:
-
-concurrency:
-  group: security-${{ github.ref }}
-  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  security:
-    name: security gate
-    runs-on: ubuntu-latest
+  source:
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
+    env:
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # audit-code diffs against the merge base with main
-
-      # Pinned release binaries, checksummed, as the other repos install them.
-      - name: Install osv-scanner v2.7.0
+      - name: Start source receipt
+        shell: bash
         run: |
-          curl -sSfL -o /tmp/osv-scanner https://github.com/google/osv-scanner/releases/download/v2.7.0/osv-scanner_linux_amd64
-          echo "160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b  /tmp/osv-scanner" | sha256sum -c -
-          install -m 0755 /tmp/osv-scanner /usr/local/bin/osv-scanner
-      - uses: actions/setup-python@v5
+          RECEIPTS="$RUNNER_TEMP/yap-source-receipts"
+          printf 'RECEIPTS=%s\n' "$RECEIPTS" >> "$GITHUB_ENV"
+          mkdir -p "$RECEIPTS"
+          printf 'checkout_target=%s\npr_head=%s\npr_base=%s\n' \
+            "$GITHUB_SHA" "$PR_HEAD_SHA" "$PR_BASE_SHA" > "$RECEIPTS/source.txt"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # verified v4 commit
         with:
-          python-version: "3.12"
-      - name: Install Semgrep and gitleaks
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check source and record toolchain and lock digests
+        shell: bash
         run: |
-          pip install semgrep==1.181.0
-          curl -sSfL -o /tmp/gitleaks.tgz https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
-          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  /tmp/gitleaks.tgz" | sha256sum -c -
-          tar -xzf /tmp/gitleaks.tgz -C /usr/local/bin gitleaks
-
-      - name: Dependencies (OSV-Scanner)
-        run: bash scripts/audit-deps.sh
-      - name: Code and secrets (Semgrep, gitleaks)
-        run: bash scripts/audit-code.sh
+          set -euo pipefail
+          {
+            actual="$(git rev-parse HEAD)"
+            printf 'source_sha=%s\n' "$actual"
+            test "$actual" = "$GITHUB_SHA"
+            uname -a
+            cat /etc/os-release
+            python3 --version
+            bash --version
+            sha256sum app/Package.resolved scripts/python_pin.sh backend/requirements*.txt
+            set -x
+            git diff --check "$PR_BASE_SHA" HEAD
+            git ls-files -z -- 'scripts/*.sh' scripts/yap | while IFS= read -r -d '' script; do
+              bash -n "$script"
+            done
+            python3 -I -B tests/security_static/test_policy.py
+          } 2>&1 | tee "$RECEIPTS/checks.log"
+      - name: Record source check status
+        if: always()
+        shell: bash
+        env:
+          STATUS: ${{ job.status }}
+        run: |
+          printf 'source_job_status=%s\n' "$STATUS" >> "$RECEIPTS/source.txt"
+          printf '%s\n' 'Runtime tests, advisory/code/secret scans, and release checks were not run.' >> "$RECEIPTS/source.txt"
+      - name: Upload source receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: yap-source-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.RECEIPTS }}
+          if-no-files-found: error
+          retention-days: 7
