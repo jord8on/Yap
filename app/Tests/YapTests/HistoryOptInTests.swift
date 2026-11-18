@@ -75,10 +75,34 @@ final class HistoryOptInTests: XCTestCase {
         try bytes.write(to: target)
         try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: target.path)
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
-        XCTAssertNil(HistoryStore.readPrivateSnapshot(at: link))
+        XCTAssertThrowsError(try HistoryStore.readPrivateSnapshot(at: link))
         XCTAssertEqual(try Data(contentsOf: target), bytes)
         let attributes = try FileManager.default.attributesOfItem(atPath: target.path)
         XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o644)
+    }
+
+    @MainActor
+    func testRefusedExistingHistoryIsNotOverwrittenAfterOptIn() async throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appending(path: "history.json")
+        let alias = dir.appending(path: "history-alias.json")
+        let entry = HistoryEntry(kind: .dictated, text: "Existing retained history")
+        let bytes = try JSONEncoder().encode(["dictated": [entry], "spoken": []])
+        try bytes.write(to: file)
+        try FileManager.default.linkItem(at: file, to: alias)
+        let store = HistoryStore(fileURL: file, recordingEnabled: { true })
+        // Exercise both a pending save during loading and a later explicit save.
+        store.recordDictated("New entry during initial load")
+        let refused = await eventually { store.storageWarning != nil }
+        XCTAssertTrue(refused)
+        store.recordDictated("New entry after refused read")
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(try Data(contentsOf: file), bytes)
+        XCTAssertEqual(try Data(contentsOf: alias), bytes)
+        let attributes = try FileManager.default.attributesOfItem(atPath: file.path)
+        XCTAssertEqual((attributes[.referenceCount] as? NSNumber)?.intValue, 2)
     }
 
     @MainActor

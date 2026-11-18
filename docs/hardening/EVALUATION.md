@@ -112,3 +112,10 @@ that pair rather than silently deleting or rotating identity material. Atomic
 pair publication/recovery remains an explicit review item before daily use.
 Do not repair this by disabling authentication, TLS, or platform checks. It does
 not make an untested build release-ready.
+
+The bounded follow-up review found that a refused legacy-history read could be
+mistaken for an absent file. Loading now distinguishes missing, loaded and
+refused states. A refusal blocks persistence for the session and displays a
+warning; new opt-in writes cannot replace the retained file. A hard-link
+regression covers saves queued before and after refusal. This Swift test is
+written but has not yet run on macOS.

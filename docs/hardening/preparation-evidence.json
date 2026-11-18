@@ -28,7 +28,8 @@
       "Explicit approved PR-label test trigger instead of inaccessible dispatch-only workflow",
       "Allowlisted actual child environment excluding unrelated credentials and trust overrides",
       "Private test_tts identity and restored globals",
-      "Existing user-owned regular history restricted before loading without rewriting bytes"
+      "Existing user-owned regular history restricted before loading without rewriting bytes",
+      "Refused/corrupt history load is distinct from missing; persistence blocked with visible warning to avoid replacing retained entries"
     ],
     "open": [
       "P2 interrupted first TLS identity publication can leave a partial pair; startup fails closed; atomic pair publication remains daily-use blocker"

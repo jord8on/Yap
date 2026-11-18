@@ -40,6 +40,7 @@ final class HistoryStore: ObservableObject {
 
     @Published private(set) var spoken: [HistoryEntry] = []
     @Published private(set) var dictated: [HistoryEntry] = []
+    @Published private(set) var storageWarning: String?
 
     private let fileURL: URL
     private let recordingEnabled: @MainActor () -> Bool
@@ -61,6 +62,11 @@ final class HistoryStore: ObservableObject {
     private var clearedDictatedDuringLoad = false
 
     private struct Snapshot: Codable, Sendable { var spoken: [HistoryEntry]; var dictated: [HistoryEntry] }
+    private enum LoadResult: Sendable {
+        case missing
+        case loaded(Snapshot)
+        case refused
+    }
 
     init(fileURL: URL, recordingEnabled: @escaping @MainActor () -> Bool) {
         self.fileURL = fileURL
@@ -128,11 +134,18 @@ final class HistoryStore: ObservableObject {
     private func load() {
         let url = fileURL
         Task {
-            let snap = await Task.detached(priority: .userInitiated) { () -> Snapshot? in
-                guard let data = Self.readPrivateSnapshot(at: url) else { return nil }
-                return try? JSONDecoder().decode(Snapshot.self, from: data)
+            let result = await Task.detached(priority: .userInitiated) { () -> LoadResult in
+                do {
+                    guard let data = try Self.readPrivateSnapshot(at: url) else { return .missing }
+                    return .loaded(try JSONDecoder().decode(Snapshot.self, from: data))
+                } catch {
+                    return .refused
+                }
             }.value
-            if let snap {
+            if case .refused = result {
+                storageWarning = "Existing history could not be safely read. It was left unchanged; new history will not be saved in this session."
+            }
+            if case .loaded(let snap) = result {
                 spoken = Self.merged(window: spoken, restored: snap.spoken,
                                      cleared: clearedSpokenDuringLoad, deleted: deletedDuringLoad)
                 dictated = Self.merged(window: dictated, restored: snap.dictated,
@@ -146,23 +159,34 @@ final class HistoryStore: ObservableObject {
 
     /// Preserve legacy bytes while restricting the existing inode before reading.
     /// Do not follow a symlink or modify a file owned by a different user.
-    nonisolated static func readPrivateSnapshot(at url: URL) -> Data? {
+    nonisolated static func readPrivateSnapshot(at url: URL) throws -> Data? {
         let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-        guard fd >= 0 else { return nil }
+        guard fd >= 0 else {
+            let code = errno
+            if code == ENOENT { return nil }
+            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+        }
         defer { close(fd) }
         var info = stat()
         guard fstat(fd, &info) == 0,
               info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
-              info.st_uid == geteuid(), info.st_nlink == 1,
-              fchmod(fd, 0o600) == 0 else { return nil }
+              info.st_uid == geteuid(), info.st_nlink == 1 else {
+            throw POSIXError(.EPERM)
+        }
+        guard fchmod(fd, 0o600) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
-        return try? handle.readToEnd()
+        return try handle.readToEnd() ?? Data()
     }
 
     private func save() {
         // Don't persist until the initial load has merged in the on-disk history,
         // or an early save would truncate the file to just the in-window entries.
         guard loaded else { pendingSave = true; return }
+        // A refused or corrupt existing file is not an empty history. Never
+        // replace it with a new snapshot after an unsuccessful initial read.
+        guard storageWarning == nil else { return }
         let spokenCopy = spoken, dictatedCopy = dictated, url = fileURL
         io.async {
             guard let data = try? JSONEncoder().encode(

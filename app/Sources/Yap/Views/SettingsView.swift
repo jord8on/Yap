@@ -558,6 +558,9 @@ private struct HistoryTab: View {
             Toggle("Save full dictated and spoken text", isOn: $prefs.historyEnabled)
             Text("If enabled, Yap saves full text as plaintext JSON on this Mac. History recording is off by default. This update turned it off once for existing installations and kept existing entries. You can delete entries here at any time.")
                 .font(.caption).foregroundStyle(.secondary)
+            if let warning = history.storageWarning {
+                Text(warning).font(.caption).foregroundStyle(.red)
+            }
             Picker("", selection: $kind) {
                 Text("Dictated (\(history.dictated.count))").tag(HistoryEntry.Kind.dictated)
                 Text("Spoken (\(history.spoken.count))").tag(HistoryEntry.Kind.spoken)
