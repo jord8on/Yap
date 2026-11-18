@@ -138,6 +138,11 @@ final class Dictation: ObservableObject {
     static var immediateStop = false
     private var captureGate: DictationCaptureGate?
     private(set) var lastStopCapturedFrames = 0
+    private let prefs: Prefs?
+
+    init(prefs: Prefs? = nil) {
+        self.prefs = prefs
+    }
 
     var isListening: Bool { state == .listening }
 
@@ -189,7 +194,7 @@ final class Dictation: ObservableObject {
         // Record the latest request up front so a superseding switch is detectable
         // after each await; the picker also reflects the new selection immediately.
         engineChoice = choice
-        Prefs.shared.dictationEngine = choice.rawValue
+        (prefs ?? .shared).dictationEngine = choice.rawValue
         if Dictation.loadMayWriteState(starting: starting, state: state) { state = .loadingModel }
         do {
             let mgr = choice.variant.createManager()
@@ -390,7 +395,7 @@ final class Dictation: ObservableObject {
                 text = try await manager.finish().trimmingCharacters(in: .whitespacesAndNewlines)
                 path = "live stream"
             }
-            if Prefs.shared.removeFillers { text = Fillers.clean(text) }
+            if (prefs ?? .shared).removeFillers { text = Fillers.clean(text) }
             let passes = previewPassMs
             lastStop = String(format: "%@ in %.0f ms (%.1fs of audio; window %.0f, pump %.0f, preview wait %.0f, decode %.0f ms; %d preview passes, last %.0f, max %.0f ms)",
                               path, Date().timeIntervalSince(t0) * 1000, Double(total) / rate,

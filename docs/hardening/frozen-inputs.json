@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "purpose": "Frozen integration inputs; not binary provenance or release approval",
+  "upstream_sha": "6b9375f99f0ece993bedbf10cbbe4662c1c0f02b",
+  "donor_sha": "3ffd2a9a0e1f11e7bb9be7e669232731ff636c19",
+  "remaining_gates": [
+    "native inventory",
+    "fresh advisory scan",
+    "model revision/hash manifest",
+    "observed egress",
+    "interactive permissions",
+    "final signature stability",
+    "normal notarized distribution",
+    "independent release review"
+  ],
+  "dependencies": {
+    "backend/requirements.txt": {
+      "git_blob": "18701c03a19a818385d0a11419833e765de31f6c",
+      "sha256": "c46d1ee83d98b17826bf3132a948e57c74c8e182311f6126e1de7c667c400690",
+      "package_count": 42,
+      "selected_native_wheels": "Not selected or downloaded during source integration"
+    },
+    "backend/requirements-pocket.txt": {
+      "git_blob": "23db28c843f8fb853d0e14be220917517d37b12e",
+      "sha256": "62a791ad19cbdbdf00ba785f1dc0f979a5c06537f402c04834f2ba0ef880faab",
+      "package_count": 59,
+      "selected_native_wheels": "Not selected or downloaded during source integration"
+    },
+    "scripts/python_pin.sh": {
+      "git_blob": "8daea180a61f1780c4745eb1a683294898276c13",
+      "sha256": "0860a1df19ab9a8c4900ddd1edaf48472612199ba464c4b8304f8afbd6982cf1"
+    },
+    "app/Package.resolved": {
+      "git_blob": "55f80ae0623ea1dd703c056ab549f05ac80cee30",
+      "sha256": "a11bbd9618869e7c04a3a089e4615ad0525002a538e11adee048f86c3ec9524f"
+    }
+  },
+  "swift_dependency": {
+    "name": "FluidAudio",
+    "version": "0.15.4",
+    "revision": "b9d43724cbdb5a980e441fd54180964e94d470f7"
+  }
+}

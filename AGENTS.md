@@ -1,5 +1,15 @@
 # Agent guide: Yap
 
+## Hardening PR policy — source-only preparation
+
+For this PR, edit and inspect source only. Do not build or launch Yap or its
+sidecar, run project tests locally, install dependencies, or touch applications,
+personal app data, signing identities, keychains, or system settings. Do not
+remove quarantine, override Gatekeeper, install on a primary Mac, publish,
+merge, or notarize in this PR. Legacy build, release, and test recipes below
+are outside this mission. The automatic PR job is source-only and the hosted
+macOS job requires explicit manual opt-in. See [evaluation scope and gates](docs/hardening/EVALUATION.md).
+
 For any agent (build, fix, review, extend) working on this repo. Yap gives a
 Mac (and the AI agents you work with) **voice and ears**, fully local. Voice:
 highlight text anywhere, press a hotkey, hear it in a local Kokoro or Pocket TTS
@@ -38,11 +48,9 @@ pieces an agent must keep in sync if touching either side:
   only when the response carries `X-Stream-Footer` (an older sidecar doesn't, and
   must still work). Withhold it on any failure; never let a truncated read finish
   clean. Why a footer and not an abort: `docs/ARCHITECTURE.md`.
-- **Backend lifecycle is reuse-first, but a responding backend is not always
-  left alone.** `BackendManager` reuses one that answers `/health` *and* proves
-  itself via `/verify`; an unverified Yap orphan or a verified-but-not-ready one
-  gets stopped and relaunched, and an unverified foreign listener is refused
-  outright. `ownsProcess` means "we may end this process", not "we started it".
+- **Backend lifecycle requires pinned TLS and a valid `/verify` proof.**
+  `BackendManager` refuses an unverified listener and does not treat a process
+  name as permission to stop it.
   The full decision table: `docs/ARCHITECTURE.md`.
 
 ## Two engines (Kokoro + Pocket TTS)
@@ -225,12 +233,11 @@ and writes `dist/python-runtime/`. `build_app.sh` embeds that at
 and spawns `server.py` directly; only a dev checkout with no embedded runtime
 falls back to `run_backend.sh` (venv from system Python).
 
-Gatekeeper reality: ad-hoc signed + downloaded-from-browser = quarantine →
-"damaged and can't be opened." The app self-strips its own quarantine on launch
-(`BackendManager.stripQuarantine`) so the nested Python can spawn, but the main
-app still needs `xattr -cr` or notarization. True double-click distribution
-requires `scripts/notarize.sh` + a paid Apple Developer ID. Don't claim
-"download and run" works frictionless until it's notarized.
+Preserve quarantine through staging and installation. Normal local builds
+require the configured local signing identity and a valid code signature.
+The manually dispatched evaluation uses explicit ad-hoc development signing.
+Release acceptance requires Developer ID, notarization, and testing the exact
+distribution artifact under normal Gatekeeper settings.
 
 ## Where state lives (not in the repo)
 
@@ -243,7 +250,7 @@ These paths are gitignored and machine-local. `scripts/run_backend.sh` builds th
 venv on first run (uses `uv` if present, else `python3 -m venv`). Never commit
 models, the venv, `.build/`, or `dist/`.
 
-## Build, run, validate
+## Build, run, validate (outside this PR)
 
 ```bash
 # backend alone (auto-builds venv first run, then serves on :8766)
@@ -297,7 +304,7 @@ bash scripts/build_app.sh && open -n -W dist/Yap.app --stdout /tmp/readbutton.tx
 # launch rules as above. --legacy is the control.
 bash scripts/build_app.sh && open -n -W dist/Yap.app --stdout /tmp/capturetest.txt --args --capturetest [--legacy]; cat /tmp/capturetest.txt
 
-# security gate (CI runs it on every PR: .github/workflows/security.yml)
+# Separate scanner gate on an approved isolated surface before release review
 bash scripts/audit-deps.sh && bash scripts/audit-code.sh
 
 # backend robustness suite — fast set (every code path, one cheap case each)
@@ -347,7 +354,7 @@ Review/merge follows the user-scope **`review-cycle`** skill. Project-specific o
 
 **Don't flag (reviewers): `Task {}` inside `AppState` is already on the main actor.** `AppState` is a `@MainActor` class, so every method is main-actor-isolated and a plain `Task { … }` created inside one **inherits main-actor isolation** — its body, including `@Published` reads/writes (`prefs.*`, `hdWarm`, `cloningReady`, `warming`), runs on the main actor. This is **not** the off-main audio-stream callback the "hop to `@MainActor`" note in the Pocket section warns about (that's a real-time AVFoundation thread). Shipped precedent: `refreshHD`. So "off-main `@Published` access / data race" on such a `Task {}` is a false positive — don't raise it.
 
-## Local test builds (after every merge — standing)
+## Local test builds (outside this PR)
 
 A merged code change is invisible to Lino until it's a running build on his Mac.
 So **after merging any code change, cut a fresh local build and install it** so
@@ -388,12 +395,12 @@ Yap reads no Keychain items at all, so a re-signed build prompts for nothing.
 (TCC Accessibility/Mic grants bind to the stable "Yap Local Signing" cert, so those
 persist across rebuilds.)
 
-## Releases
+## Releases (outside this PR)
 
 Versioned in `app/Resources/Info.plist` (`CFBundleShortVersionString`).
-`make_dmg.sh` reads it for the DMG name. App is ad-hoc signed, not notarized.
-Three install paths exist (see README): Homebrew cask, DMG + `xattr -cr`,
-build-from-source.
+`make_dmg.sh` reads it for the DMG name. A future release requires the signed,
+notarized distribution and acceptance evidence listed in the evaluation gates.
+Review the external Homebrew cask for quarantine preservation before offering it.
 
 `scripts/release.sh` never writes to `main` of either repo. Two steps:
 
@@ -415,12 +422,6 @@ scripts/release.sh publish X.Y.Z [--yes] [--no-install] [--dry-run]
   check would otherwise offer the release it just shipped (`--no-install` skips
   it; a failed reinstall only warns). Without `--yes` it only prints
   the plan. If main moved after prepare, rerun prepare.
-
-Refresh an existing release's binary in place:
-`gh release upload vX.Y.Z dist/Yap-X.Y.Z.dmg --clobber`. The cask's
-`postflight` runs `xattr -cr`, so `brew install --cask latent-variable/tap/yap`
-installs with no Gatekeeper prompt; skipping the tap PR leaves brew users on
-the old version.
 
 ## Acceleration (measured, not assumed)
 

@@ -29,12 +29,12 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     var subtitle: String {
         switch self {
         case .general:     return "What's on, what it reads, how it sounds off."
-        case .voice:       return "Pick an engine and a voice, clone your own, tune how it plays."
+        case .voice:       return "Choose a reading voice and tune playback."
         case .dictation:   return "Language, sounds and filler words for push-to-talk."
         case .capture:     return "What Yap may read and hear, and how it grabs your selection."
         case .cleanup:     return "Strip Markdown, code and citations before they're spoken."
         case .shortcut:    return "Global keys for reading and dictating."
-        case .history:     return "Everything you've read and dictated, kept on this Mac."
+        case .history:     return "Saved reads and dictations on this Mac."
         case .agents:      return "Teach your AI agents to talk to you."
         case .models:      return "Download, check and delete each local model."
         case .diagnostics: return "Backend health, acceleration and capture checks."
@@ -104,6 +104,11 @@ struct SettingsView: View {
     static let minSize = CGSize(width: 780, height: 540)
 
     @AppStorage("settingsPane") private var pane = SettingsTab.general
+    private let history: HistoryStore?
+
+    init(history: HistoryStore? = nil) {
+        self.history = history
+    }
 
     var body: some View {
         NavigationSplitView {
@@ -124,7 +129,7 @@ struct SettingsView: View {
         } detail: {
             VStack(spacing: 0) {
                 paneHeader
-                pane.content
+                pane.content(history: history)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
             .navigationTitle(pane.title)
@@ -171,7 +176,7 @@ struct SettingsView: View {
 private extension SettingsTab {
     /// The pane body. Form panes bring their own grouped insets; the free-form
     /// panes get matching padding so every pane lines up under the header.
-    @ViewBuilder var content: some View {
+    @MainActor @ViewBuilder func content(history: HistoryStore?) -> some View {
         switch self {
         case .general:     GeneralTab()
         case .voice:       VoicesPane()
@@ -179,7 +184,7 @@ private extension SettingsTab {
         case .capture:     PermissionsTab()
         case .cleanup:     CleanupTab().padding(.horizontal, 20).padding(.vertical, 12)
         case .shortcut:    ShortcutTab()
-        case .history:     HistoryTab().padding(.horizontal, 20).padding(.vertical, 12)
+        case .history:     HistoryTab(history: history ?? .shared).padding(.horizontal, 20).padding(.vertical, 12)
         case .agents:      AgentsTab()
         case .models:      ModelsTab()
         case .diagnostics: DiagnosticsTab()
@@ -197,6 +202,10 @@ private struct GeneralTab: View {
             Section("Features") {
                 Toggle("Reading aloud (voice)", isOn: $prefs.voiceEnabled)
                     .onChange(of: prefs.voiceEnabled) { _, _ in state.reapplyHotKey() }
+                Toggle("Load the reading model at launch", isOn: $prefs.autoStartVoice)
+                    .disabled(!prefs.voiceEnabled)
+                Text("Launch loading downloads the Kokoro model if needed. With it off, use Models to set up Kokoro or start a read when you're ready.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Toggle("Dictation (ears)", isOn: $prefs.dictationEnabled)
                     .onChange(of: prefs.dictationEnabled) { _, _ in DictationController.shared.reapplyHotKey() }
                 Text("Turn a feature off to disable its global shortcut. The other keeps working. With Dictation on, its models load at launch and download if missing. While it is off, the menu's Dictate button and Settings ▸ Models can still download them.")
@@ -218,7 +227,7 @@ private struct GeneralTab: View {
 
             Section("Updates") {
                 Toggle("Automatically check for updates", isOn: $prefs.autoUpdateCheck)
-                Text("At launch, Yap automatically checks GitHub for the latest release if at least 24 hours have passed since the last successful check. This sends no personal data. Turning it off stops update checks only. Dictation and Pocket models can still download at launch.")
+                Text("Off by default. When enabled, Yap checks GitHub at launch if at least 24 hours have passed since the last successful check. You can also check manually.")
                     .font(.caption).foregroundStyle(.secondary)
                 HStack {
                     Button(state.checkingForUpdate ? "Checking…" : "Check now") {
@@ -267,7 +276,7 @@ private struct DictationTab: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
-                Text("A live preview floats while you talk; drag it anywhere and it opens there next time. The final, more accurate transcript is pasted at your cursor, and every dictation is kept in History.")
+                Text("A live preview floats while you talk. Drag it anywhere and it opens there next time. Yap pastes the final transcript at your cursor and saves it only if History is enabled.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -525,12 +534,17 @@ private struct HotKeyRecorder: View {
 // MARK: - History
 
 private struct HistoryTab: View {
-    @ObservedObject private var history = HistoryStore.shared
+    @EnvironmentObject private var prefs: Prefs
+    @ObservedObject private var history: HistoryStore
     // Dictation is the more-used half, so it leads and is the default view.
     @State private var kind: HistoryEntry.Kind = .dictated
     @State private var query = ""
     @State private var expanded: Set<UUID> = []
     @State private var confirmClear = false
+
+    init(history: HistoryStore) {
+        self.history = history
+    }
 
     private var entries: [HistoryEntry] {
         let all = kind == .spoken ? history.spoken : history.dictated
@@ -541,6 +555,12 @@ private struct HistoryTab: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            Toggle("Save full dictated and spoken text", isOn: $prefs.historyEnabled)
+            Text("If enabled, Yap saves full text as plaintext JSON on this Mac. History recording is off by default. This update turned it off once for existing installations and kept existing entries. You can delete entries here at any time.")
+                .font(.caption).foregroundStyle(.secondary)
+            if let warning = history.storageWarning {
+                Text(warning).font(.caption).foregroundStyle(.red)
+            }
             Picker("", selection: $kind) {
                 Text("Dictated (\(history.dictated.count))").tag(HistoryEntry.Kind.dictated)
                 Text("Spoken (\(history.spoken.count))").tag(HistoryEntry.Kind.spoken)
@@ -600,7 +620,7 @@ private struct HistoryTab: View {
             Image(systemName: query.isEmpty ? "clock" : "magnifyingglass")
                 .font(.largeTitle).foregroundStyle(.tertiary)
             Text(query.isEmpty
-                 ? (kind == .spoken ? "Nothing read aloud yet." : "Nothing dictated yet.")
+                 ? (kind == .spoken ? "No saved reads." : "No saved dictations.")
                  : "No matches.")
                 .foregroundStyle(.secondary)
         }
@@ -701,21 +721,24 @@ private struct ModelsTab: View {
     /// Walk model dirs off the main actor (can be large) and cache the formatted
     /// sizes — never size a directory inside the SwiftUI body.
     private func refreshSizes() {
-        let kdir = state.backend.modelsDir, hdir = state.hdPackagesDir
-        // Deleting Pocket reclaims the cloning weights too, so the figure here has
-        // to include them. Counting only hd-packages understated it by 209 MB and
-        // made the delete look like it freed more than it claimed.
-        let wdir = state.hdVoicesDir.deletingLastPathComponent().appending(path: "pocket-weights")
-        let kPresent = state.modelsPresent, hdPresent = state.hdInstalled
+        let kdir = state.backend.modelsDir
+        let kPresent = state.modelsPresent
+        let hdir = EvaluationPolicy.pocketEnabled && state.hdInstalled ? state.hdPackagesDir : nil
         sizeTask?.cancel()   // supersede any in-flight walk; avoid redundant disk I/O
         let pdir = Dictation.modelsDirOnDisk
         let pPresent = Dictation.modelsPresentOnDisk
         sizeTask = Task {
             // static dirSizeBytes — no @MainActor state captured into this task.
             let kb = kPresent ? await Task.detached { AppState.dirSizeBytes(kdir) }.value : 0
-            let hb = hdPresent ? await Task.detached {
-                AppState.dirSizeBytes(hdir) + AppState.dirSizeBytes(wdir)
-            }.value : 0
+            let hb: Int64
+            if let hdir {
+                let wdir = hdir.deletingLastPathComponent().appending(path: "pocket-weights")
+                hb = await Task.detached {
+                    AppState.dirSizeBytes(hdir) + AppState.dirSizeBytes(wdir)
+                }.value
+            } else {
+                hb = 0
+            }
             let pb = pPresent ? await Task.detached { AppState.dirSizeBytes(pdir) }.value : 0
             if Task.isCancelled { return }
             kokoroSize = kb > 0 ? Self.sizeFmt.string(fromByteCount: kb) : nil
@@ -743,6 +766,9 @@ private struct ModelsTab: View {
                     Button("Download model (~340 MB)") { dl.start() }
                 } else if state.backend.ownsProcess {
                     Button("Delete model", role: .destructive) { confirmDeleteKokoro = true }
+                } else if !state.backend.ready {
+                    Button("Load model") { Task { await state.startVoice() } }
+                        .disabled(state.status == .loadingModel)
                 } else {
                     Text("Connected to a backend Yap didn't start — restart Yap to manage models.")
                         .font(.caption).foregroundStyle(.secondary)
@@ -755,39 +781,16 @@ private struct ModelsTab: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
-            Section("Pocket model") {
-                LabeledContent("Status",
-                    value: state.hdInstalled ? "Installed" : "Not installed")
-                if state.hdInstalled, let s = hdSize {
-                    LabeledContent("Size on disk", value: s)
-                }
-                LabeledContent("Location", value: state.hdPackagesDir.path)
-                    .font(.caption)
-                if state.deletingHD {
-                    HStack { ProgressView().controlSize(.small); Text("Deleting model…").font(.caption) }
-                } else if hdInstalling {
-                    HStack { ProgressView().controlSize(.small); Text("Installing… keep this open").font(.caption) }
-                    ScrollView { Text(hdInstallLog).font(.caption.monospaced())
-                        .frame(maxWidth: .infinity, alignment: .leading) }.frame(height: 90).border(.quaternary)
-                } else if !state.hdInstalled {
-                    Text("Optional ~1 GB engine for natural built-in voices and cloning. Its model files download when Pocket first loads.")
-                        .font(.caption).foregroundStyle(.secondary)
-                    Button("Download & install Pocket") {
-                        hdInstalling = true; hdInstallLog = ""
-                        Task {
-                            await state.installHD { line in hdInstallLog += line + "\n" }
-                            hdInstalling = false
-                        }
-                    }.buttonStyle(.borderedProminent)
-                } else if state.backend.ownsProcess {
-                    Button("Delete model", role: .destructive) { confirmDeleteHD = true }
-                } else {
-                    Text("Connected to a backend Yap didn't start — restart Yap to manage models.")
+            if !EvaluationPolicy.pocketEnabled {
+                Section("Pocket model") {
+                    Text(EvaluationPolicy.pocketUnavailableMessage)
                         .font(.caption).foregroundStyle(.secondary)
                 }
+            } else {
+                pocketModelSection
             }
 
-            if state.hdInstalled {
+            if EvaluationPolicy.pocketEnabled && state.hdInstalled {
                 Section {
                     Toggle("Pre-load Pocket at launch", isOn: $prefs.autoLoadHD)
                     Text("Loads Pocket in the background at launch, so the first read plays right away. It always loads at launch when Pocket is the active engine. Missing model files download when it loads.")
@@ -860,6 +863,40 @@ private struct ModelsTab: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Removes the downloaded dictation models. They download again at launch when Dictation is on, or the next time you dictate or pick a model.")
+        }
+    }
+
+    private var pocketModelSection: some View {
+        Section("Pocket model") {
+            LabeledContent("Status",
+                value: state.hdInstalled ? "Installed" : "Not installed")
+            if state.hdInstalled, let s = hdSize {
+                LabeledContent("Size on disk", value: s)
+            }
+            LabeledContent("Location", value: state.hdPackagesDir.path)
+                .font(.caption)
+            if state.deletingHD {
+                HStack { ProgressView().controlSize(.small); Text("Deleting model…").font(.caption) }
+            } else if hdInstalling {
+                HStack { ProgressView().controlSize(.small); Text("Installing… keep this open").font(.caption) }
+                ScrollView { Text(hdInstallLog).font(.caption.monospaced())
+                    .frame(maxWidth: .infinity, alignment: .leading) }.frame(height: 90).border(.quaternary)
+            } else if !state.hdInstalled {
+                Text("Optional ~1 GB engine for natural built-in voices and cloning. Its model files download when Pocket first loads.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Button("Download & install Pocket") {
+                    hdInstalling = true; hdInstallLog = ""
+                    Task {
+                        await state.installHD { line in hdInstallLog += line + "\n" }
+                        hdInstalling = false
+                    }
+                }.buttonStyle(.borderedProminent)
+            } else if state.backend.ownsProcess {
+                Button("Delete model", role: .destructive) { confirmDeleteHD = true }
+            } else {
+                Text("Connected to a backend Yap didn't start — restart Yap to manage models.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
     }
 

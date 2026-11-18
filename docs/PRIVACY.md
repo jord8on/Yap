@@ -1,69 +1,49 @@
 # Privacy & permissions
 
-Yap is a local-first utility. This document says exactly what it does, what
-it touches, and why — so you don't have to take "private" on faith.
+This page describes the hardening evaluation's intended behavior. Runtime
+verification and release acceptance are tracked in the [evaluation checklist](hardening/EVALUATION.md).
 
 ## The short version
 
-- Runs entirely on your Mac. Speech is synthesized locally (Kokoro, or Pocket
-  TTS if you enable it); dictation is transcribed locally on the Apple Neural
+- Kokoro synthesizes speech locally. Dictation is transcribed on the Apple Neural
   Engine using Parakeet and Nemotron models.
-- No account, no sign-in, no analytics, no telemetry, no crash reporting. That
-  now covers voice cloning too: it used to need your own Hugging Face token, and
-  it no longer needs one, so Yap stores no credential of yours anywhere and reads
-  nothing from your Keychain.
-- Nothing about you is ever sent. Yap goes online only to download models and
-  to check for updates. The full list is in
-  [What goes over the network](#what-goes-over-the-network).
-- Open source. Every capability described here is in this repo.
-- Don't trust the prose? It's 2026. Point your coding agent (Claude Code or
-  similar) at this repo and let it confirm these claims, or read the source
-  yourself. Start with [`TextCapture.swift`](../app/Sources/Yap/TextCapture.swift)
-  (capture) and [`server.py`](../backend/server.py) (the only thing that touches
-  the TTS model). Or build your own and use these binaries as a reference.
+- Pocket TTS and voice cloning are disabled in the evaluation. Existing engine
+  files and recordings stay on disk.
+- Dictation, loading the reading model at launch, history recording, the agent
+  API, agent listening, and automatic update checks are off by default. The
+  upgrade resets these switches once. Choices made after the upgrade persist.
 
 ## What goes over the network
 
-Every network call Yap makes is a download or the update check. None of them
-sends your audio, your text, or anything that identifies you.
+Yap's intended outbound requests are model downloads and optional update
+checks. Model requests can expose ordinary connection metadata to their hosts.
+Full runtime egress verification is pending.
 
 **At launch, without a click:**
 
-- **The Kokoro voice** (~340 MB), only when no voice is installed: no Kokoro
-  files and no Pocket engine. Both files are checked against pinned SHA-256
-  hashes before use. If the download fails, pressing the read shortcut tries
-  again. If you delete Kokoro in Settings ▸ Models with Pocket not installed,
-  it downloads again at the next launch. Turn off **Reading aloud (voice)** in
-  Settings ▸ General to stop this.
-- **Dictation models.** With Dictation on (the default), Yap loads the selected
+- **The Kokoro voice** (~340 MB), when **Reading aloud (voice)** and **Load the
+  reading model at launch** are on and Kokoro's files are missing. Both files
+  are checked against pinned SHA-256 hashes.
+- **Dictation models.** With Dictation enabled, Yap loads the selected
   model pair at launch and downloads any missing files. English uses Parakeet
   Flash for streaming and Parakeet TDT v2 for the final pass; multilingual uses
   Nemotron and Parakeet TDT v3. They are cached in
   `~/Library/Application Support/FluidAudio/Models`. If you delete them in
   Settings ▸ Models, they download again at the next launch. Turn off
   **Dictation (ears)** in Settings ▸ General to stop this.
-- **Pocket model files.** Once the Pocket engine is installed, its model files
-  (weights, tokenizer and built-in voices) download from Hugging Face the first
-  time Pocket loads. Pocket loads at launch when it is the selected engine, or
-  when **Pre-load Pocket at launch** is on (the default, in Settings ▸
-  Models). Turning pre-load off does not stop this while Pocket is selected.
 - **Automatic update checks**, at launch when enabled and at least 24 hours have
   passed since the last successful check. See [below](#the-update-check-optional).
 
 **When you ask for it:**
 
-- The Kokoro model (~340 MB), from **Download model** in Settings ▸ Models.
-- The Pocket engine's packages, from Settings ▸ Voices or Settings ▸ Models.
-  Setup also fetches the 209 MB voice-cloning weights if no usable local copy
-  exists, even if you only use catalog voices. **Download & enable cloning** in
-  Settings ▸ Voices ▸ Clone a voice fetches them on their own.
-- The free CMU ARCTIC starter voices, from **Get free starter voices** in
-  Settings ▸ Voices ▸ Clone a voice.
-- Dictation models while Dictation is off, from the menu's **Dictate** button or
-  engine picker, or from Settings ▸ Models.
+- The Kokoro model (~340 MB), from a read request or **Download model** in
+  Settings ▸ Models.
+- Dictation models, when you enable Dictation, switch its model while enabled,
+  or request a download from Settings ▸ Models.
 
-Once those downloads finish, and with the update check off, idle Yap makes no
-outbound connections. Check with Little Snitch or `nettop`.
+Kokoro's sidecar listens on loopback HTTPS with a private local certificate
+and bearer token. Full dictation model revision and digest checks remain part
+of the model egress acceptance gate.
 
 ## The two permissions Yap asks for
 
@@ -108,23 +88,30 @@ grant it. The read-aloud half works without it.
 
 ## The agent API (a local socket)
 
-Other programs on your Mac can ask Yap to speak, or to listen, through a Unix
+After you enable the agent API, other programs running as your user can ask
+Yap to speak, or to listen if you grant that separately, through a Unix
 socket at `~/Library/Application Support/Yap/yap.sock`
 ([details](AGENT-API.md)). It is a file, not a network port: no connection leaves
 your Mac, web pages cannot reach it, and other macOS users cannot open it (it is
 mode `0600`). The API adds no outbound network call.
 
-It cannot stop a program running as *you* from using it. Speaking is harmless.
-Listening is not, because those programs would borrow Yap's Microphone grant
-without macOS asking them. So listening through the API is **off by default**, the
-dictation HUD shows whenever the mic is open, and the words go to the program
-that asked, not to your cursor, unless it asks for that. The whole API can be
-switched off, which removes the socket.
+Other programs running as your user can use the enabled socket. Agent listening
+has a separate opt-in because it uses Yap's Microphone grant. The dictation HUD
+shows during capture and the transcript goes to the caller. Inserting it at
+the cursor requires a separate request. Disabling the API removes the socket.
+
+## Spoken and dictated history
+
+Settings ▸ History controls recording and deletion. Enabling recording saves
+full text locally in a plaintext history file with user-only permissions.
+Turning recording off stops new entries. Existing entries stay available until
+you delete them or clear their list.
 
 ## What Yap does NOT do
 
-- No keylogging. It reads a selection only when you press the shortcut — it does
-  not observe what you type.
+- Hotkeys use registered shortcuts and a modifier-only global monitor. The
+  Settings shortcut recorder observes key presses locally while recording a
+  chord.
 - No always-on listening. The mic records only during a dictation session,
   including the 0.6-second finishing window after you press stop. A program using
   the [agent API](AGENT-API.md) starts the same session, with the same HUD, and
@@ -132,9 +119,6 @@ switched off, which removes the socket.
 - No screen reading or screenshots.
 - No background scraping. Nothing is captured unless you trigger it.
 - No clipboard hijacking. The fallback restores whatever was on your clipboard.
-- Nothing about you leaves the machine. There is no remote server, no API key, no
-  upload path in the code (the agent API is a local socket, not a network service). Outbound requests are the downloads and the update check
-  listed in [What goes over the network](#what-goes-over-the-network).
 
 ## The update check (optional)
 
@@ -145,13 +129,10 @@ the public releases API
 (`api.github.com/repos/latent-variable/Yap/releases/latest`) — no account, no
 identifier, no usage data sent. Yap just receives the latest version number,
 compares it to the running build, and shows a banner if a newer one exists. It
-never downloads or installs anything on its own: the banner links to the release
-page, and you update via Homebrew or the DMG yourself.
+links to the release page without downloading or installing an update.
 
-On by default. Turn it off in **Settings ▸ General ▸ Updates**. That stops update
-checks only; the launch downloads above are separate. The whole thing is one
-file:
-[`UpdateChecker.swift`](../app/Sources/Yap/UpdateChecker.swift).
+Off on a fresh profile. **Settings ▸ General ▸ Updates** controls automatic
+checks separately from launch model downloads. [`UpdateChecker.swift`](../app/Sources/Yap/UpdateChecker.swift)
 
 ## Read source modes and your clipboard
 
@@ -191,10 +172,10 @@ involved.
 
 ## The stale-grant gotcha (and the fix)
 
-The app is ad-hoc signed for now. macOS ties an Accessibility grant to a code
-identity, and an ad-hoc identity changes on every rebuild. So after you install
-an update, the old "on" toggle can be orphaned — present and enabled, but not
-matching the new binary. Symptom: the toggle is on yet Yap still asks.
+macOS ties an Accessibility grant to the app's code identity. An identity
+change can make an existing grant stop matching the running app. The checks
+below are for an approved isolated test environment outside this source-only
+PR.
 
 Fix it cleanly:
 

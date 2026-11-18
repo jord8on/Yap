@@ -5,9 +5,7 @@ import AppKit
 @MainActor
 final class BackendManager: NSObject, ObservableObject {
     @Published var ready = false
-    /// True only when THIS app spawned the backend process (vs reusing an
-    /// already-running one). Model deletion is unsafe against a backend we don't
-    /// own — restart() can't replace it, so it would keep serving deleted files.
+    /// True for a child process or an authenticated orphan we adopted.
     @Published private(set) var ownsProcess = false
     @Published var lastError: String?
 
@@ -21,13 +19,17 @@ final class BackendManager: NSObject, ObservableObject {
     /// always uses the default.
     let port: Int
     private let repoRootOverride: URL?
+    private let supportDirectoryOverride: URL?
+    private let auth: BackendAuth
 
-    init(port: Int = 8766, repoRootOverride: URL? = nil) {
+    init(port: Int = 8766, repoRootOverride: URL? = nil, supportDirectoryOverride: URL? = nil) {
         self.port = port
         self.repoRootOverride = repoRootOverride
-        var c = BackendClient()
-        c.base = URL(string: "http://127.0.0.1:\(port)")!
-        self.client = c
+        self.supportDirectoryOverride = supportDirectoryOverride
+        let auth = supportDirectoryOverride.map { BackendAuth(tokenFileURL: $0.appending(path: "auth-token")) }
+            ?? .local
+        self.auth = auth
+        client = BackendClient(base: URL(string: "https://127.0.0.1:\(port)")!, auth: auth)
         super.init()
         // Kill our own backend when the app quits so it doesn't linger as an
         // orphan (reparented to launchd) that the next launch can't cleanly own.
@@ -47,8 +49,7 @@ final class BackendManager: NSObject, ObservableObject {
     }
 
     var modelsDir: URL {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appending(path: "Yap/models")
+        let dir = appSupportBase.appending(path: "models")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
@@ -81,18 +82,13 @@ final class BackendManager: NSObject, ObservableObject {
     /// App-support base, WITHOUT the directory-creating side effect of `modelsDir`
     /// (which would re-create an empty models dir just from an existence check).
     private var appSupportBase: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appending(path: "Yap")
+        auth.tokenFileURL.deletingLastPathComponent()
     }
-    /// HD engine installed on disk (torch present in hd-packages). The backend
-    /// can serve HD even when the Kokoro model files are absent — a cheap check
-    /// so `ready` doesn't depend solely on Kokoro.
-    var hdInstalledOnDisk: Bool {
-        let hd = appSupportBase.appending(path: "hd-packages")
-        return FileManager.default.fileExists(atPath: hd.appending(path: "torch").path)
-    }
-    /// Whether the Kokoro model files are present (from the last /health). Distinct
-    /// from `ready`: the backend can be ready (HD) with Kokoro deleted.
+
+    /// Pocket is disabled for this evaluation. Old hd-packages do not confer readiness.
+    var hdInstalledOnDisk: Bool { false }
+
+    /// Whether the Kokoro model files are present (from the last /health).
     @Published private(set) var kokoroFilesPresent = false
 
     /// Kokoro's model files, read straight from disk. Unlike `kokoroFilesPresent`
@@ -120,147 +116,89 @@ final class BackendManager: NSObject, ObservableObject {
         return kill(pid, 0) != 0 && errno == ESRCH
     }
 
-    /// Apply a /health response to published state. `ready` means the backend can
-    /// serve *some* engine — Kokoro loaded OR HD installed — so deleting one model
-    /// doesn't make the backend look dead.
     private func apply(_ h: HealthInfo) {
         kokoroFilesPresent = h.files_present
-        ready = h.model_loaded || hdInstalledOnDisk
-        lastError = (h.files_present || hdInstalledOnDisk) ? nil : "Model files not installed."
+        ready = h.model_loaded
+        lastError = h.files_present ? nil : "Model files not installed."
     }
 
-    /// Ensure the backend is up: reuse a running one, else launch it.
+    /// Reuse a verified listener, or launch the backend on an available port.
     func start() async {
         discardExitedProcess()
+        guard auth.bearerToken != nil else {
+            ready = false
+            lastError = "Yap could not read or create its private authorization token. Check Application Support permissions."
+            return
+        }
+
+        let initialPID: pid_t? = process == nil && adoptedPID == nil
+            ? await Self.backendListenerPID(port: port) : nil
         if let h = await client.health() {
-            // A server we didn't spawn answers on our port. Don't trust it with
-            // captured text until it proves it's a genuine Yap backend (knows the
-            // shared secret via /verify) — an impostor that squatted :8766 can't
-            // read the 0600 token file, so it can't produce a valid proof.
-            if process == nil, adoptedPID == nil, !(await client.verifyAuthentic()) {
-                // Verification failed. Distinguish two cases:
-                //  • Identifiably a Yap server.py orphan (ppid==1) → almost always
-                //    a STALE pre-auth backend left running across an app upgrade
-                //    (no /verify endpoint yet). Reclaim it: kill and relaunch a
-                //    fresh, authenticated backend so the upgrade "just works".
-                //  • Otherwise it's a foreign listener / impostor → never hand it
-                //    captured text; bail with a clear error.
-                if let pid = await Self.orphanBackendPID(port: port) {
-                    adoptedPID = pid
-                    await stopAndWait()          // SIGTERM + wait, frees the port
-                    await launchProcess()
-                    await waitForHealth()
-                } else {
-                    lastError = "Another process is using port \(port); it's not a Yap backend. Quit it and relaunch."
-                    ready = false
-                }
-                return
-            }
             apply(h)
-            // Reusing a verified live backend. If it's an orphaned Yap backend
-            // (its spawner died → reparented to launchd), adopt it so model
-            // management isn't blocked. A backend started by hand in a terminal
-            // (ppid != 1) is left external on purpose.
-            if process == nil, adoptedPID == nil, let pid = await Self.orphanBackendPID(port: port) {
+            // Recheck the listener before adopting it by PID. An unauthenticated
+            // listener, including a legacy cleartext backend, is never signaled.
+            if process == nil, adoptedPID == nil, let initialPID,
+               let pid = await Self.orphanBackendPID(port: port), pid == initialPID,
+               process == nil, adoptedPID == nil {
                 adoptedPID = pid
                 ownsProcess = true
             }
-            if ready { return }
-            // Responsive but nothing installable (no Kokoro files, no HD) — don't
-            // launch/spin waiting for a model that was deleted.
-            if !h.files_present && !hdInstalledOnDisk { return }
-            // A live backend is holding the port but isn't ready. Don't spawn a
-            // second process onto the same port (it would fail to bind / crash):
-            //  • adopted orphan → we own it, so free the port, then relaunch fresh.
-            //  • not ours (e.g. a hand-started dev backend) → leave it; bail.
+            if ready || !h.files_present { return }
             if adoptedPID != nil { await stopAndWait() } else { return }
+        } else if process == nil && adoptedPID == nil,
+                  await Self.backendListenerPID(port: port) != nil,
+                  process == nil, adoptedPID == nil {
+            ready = false
+            lastError = "An unverified process is using port \(port). Quit it before relaunching Yap."
+            return
         }
-        await launchProcess()
+
+        launchProcess()
         await waitForHealth()
     }
 
     /// Path to a bundled, self-contained Python runtime, if present.
     private var bundledPython: URL? {
-        guard let res = Bundle.main.resourceURL else { return nil }
+        guard repoRootOverride == nil, let res = Bundle.main.resourceURL else { return nil }
         let py = res.appending(path: "python/bin/python3")
         return FileManager.default.isExecutableFile(atPath: py.path) ? py : nil
     }
 
-    /// Strip the download-quarantine flag from our own bundle so the nested
-    /// Python binaries can be spawned. Safe no-op if not quarantined.
-    private func stripQuarantine() async {
-        let bundle = Bundle.main.bundleURL.path
-        guard bundle.hasSuffix(".app") else { return }
-        // xattr -dr walks the whole bundle (thousands of files) — run it off the
-        // main actor so app launch stays responsive.
-        await Task.detached(priority: .userInitiated) {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
-            p.arguments = ["-dr", "com.apple.quarantine", bundle]
-            // Only wait if the launch actually succeeded — waitUntilExit() on a
-            // process that never ran raises an Obj-C exception.
-            do { try p.run(); p.waitUntilExit() } catch { }
-        }.value
-    }
-
-    private func launchProcess() async {
+    private func launchProcess() {
         discardExitedProcess()
-        guard process == nil else { return }
-        if bundledPython != nil { await stripQuarantine() }
+        guard process == nil, adoptedPID == nil else { return }
         let p = Process()
-        var env = ProcessInfo.processInfo.environment
-        env["YAP_MODELS_DIR"] = modelsDir.path
+        var env = ModelNetworkPolicy.sanitizedEnvironment(ProcessInfo.processInfo.environment)
+        env = env.filter { key, _ in
+            !key.hasPrefix("YAP_") && !key.hasPrefix("PARLEY_") && key != "BASH_ENV" && key != "ENV"
+        }
+        env.removeValue(forKey: "PYTHONPATH")
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env["PYTHONNOUSERSITE"] = "1"
+        let modelPath = modelsDir.path
+        let provider = supportDirectoryOverride == nil ? Prefs.shared.providerMode : "cpu"
+        env["YAP_MODELS_DIR"] = modelPath
         env["YAP_PORT"] = String(port)
-        env["YAP_PROVIDER"] = Prefs.shared.providerMode
-        // Hand the spawned backend the same token file we read, so it requires
-        // our shared secret on every request (blocks website CSRF + impostors).
-        env["YAP_AUTH_TOKEN_FILE"] = BackendAuth.tokenFileURL.path
-        // If the Pocket (HD) engine is installed, run in the combined env (torch +
-        // kokoro) so one process serves both engines. hd-packages must be FIRST on
-        // PYTHONPATH so its numpy/torch import before the bundled ones.
-        let hd = modelsDir.deletingLastPathComponent().appending(path: "hd-packages")
-        let hdPresent = FileManager.default.fileExists(atPath: hd.appending(path: "torch").path)
+        env["YAP_PROVIDER"] = provider
+        env["YAP_AUTH_TOKEN_FILE"] = auth.tokenFileURL.path
 
-        if let py = bundledPython, let root = repoRoot() {
-            // Preferred: run the bundled runtime directly — no system Python.
-            let server = root.appending(path: "backend/server.py")
-            p.executableURL = py
-            p.arguments = [server.path, "--port", String(port),
-                           "--models-dir", modelsDir.path, "--provider", Prefs.shared.providerMode]
-            // Drop inherited vars that would pull in the user's Python so the
-            // relocatable runtime self-locates — THEN set PYTHONPATH to just
-            // hd-packages (when present). Order matters: a prior bug cleared this
-            // key AFTER setting it, so the engine loaded the bundled numpy instead
-            // of hd-packages' and torch failed on the version mismatch.
-            env.removeValue(forKey: "PYTHONHOME")
-            env.removeValue(forKey: "PYTHONSTARTUP")
-            env["PYTHONNOUSERSITE"] = "1"   // ignore ~/.local site-packages
-            if hdPresent {
-                env["PYTHONPATH"] = hd.path
-            } else {
-                env.removeValue(forKey: "PYTHONPATH")
-            }
-        } else if let root = repoRoot() {
-            // Dev fallback: build a venv via the shell launcher.
-            p.executableURL = URL(fileURLWithPath: "/bin/bash")
-            p.arguments = [root.appending(path: "scripts/run_backend.sh").path]
-            if hdPresent {
-                // Append the existing PYTHONPATH only if it's non-empty — a bare
-                // ":" would add an empty entry (== cwd) to sys.path.
-                if let existing = env["PYTHONPATH"], !existing.isEmpty {
-                    env["PYTHONPATH"] = hd.path + ":" + existing
-                } else {
-                    env["PYTHONPATH"] = hd.path
-                }
-            }
-            env["PATH"] = (env["PATH"] ?? "") + ":/opt/homebrew/bin:\(NSHomeDirectory())/.local/bin"
-        } else {
+        guard let root = repoRoot() else {
             lastError = "Backend not found (no bundled runtime or dev scripts)."
             return
         }
+        if let py = bundledPython {
+            let server = root.appending(path: "backend/server.py")
+            p.executableURL = py
+            p.arguments = ["-B", "-E", "-s", server.path, "--port", String(port),
+                           "--models-dir", modelPath, "--provider", provider]
+        } else {
+            p.executableURL = URL(fileURLWithPath: "/bin/bash")
+            p.arguments = [root.appending(path: "scripts/run_backend.sh").path]
+        }
         p.environment = env
 
-        let logURL = FileManager.default.temporaryDirectory.appending(path: "yap_backend.log")
+        let logDir = supportDirectoryOverride ?? FileManager.default.temporaryDirectory
+        let logURL = logDir.appending(path: "yap_backend.log")
         FileManager.default.createFile(atPath: logURL.path, contents: nil)
         let fh = try? FileHandle(forWritingTo: logURL)
         if let fh {
@@ -276,6 +214,7 @@ final class BackendManager: NSObject, ObservableObject {
                 if self.lastError == nil { self.lastError = "Backend exited unexpectedly." }
             }
         }
+        lastError = nil
         do { try p.run(); process = p; ownsProcess = true }
         catch { lastError = "Failed to launch backend: \(error.localizedDescription)" }
         // The child dup'd the log fd at run(); close the parent's copy so we
@@ -300,20 +239,14 @@ final class BackendManager: NSObject, ObservableObject {
 
     private func waitForHealth() async {
         for _ in 0..<120 { // up to ~60s (covers first-run install/model load)
-            // If we own the process and it has already exited, it crashed on
-            // startup — fail fast instead of polling /health for 60s.
-            if let p = process, !p.isRunning {
-                if lastError == nil { lastError = "Backend exited unexpectedly." }
-                return
-            }
+            // An exited child can already have been cleared by its handler.
+            discardExitedProcess()
+            guard process != nil || adoptedPID != nil else { return }
             if let h = await client.health() {
                 apply(h)
-                if ready { return }
-                // Responsive but no model will ever load (Kokoro deleted, no HD) —
-                // stop waiting instead of hanging the full 60s.
-                if !h.files_present && !hdInstalledOnDisk { return }
+                if ready || !h.files_present { return }
             }
-            try? await Task.sleep(nanoseconds: 500_000_000)
+            do { try await Task.sleep(nanoseconds: 500_000_000) } catch { return }
         }
         if !ready && lastError == nil { lastError = "Backend did not become ready in time." }
     }
@@ -331,6 +264,14 @@ final class BackendManager: NSObject, ObservableObject {
 
     // MARK: Orphan detection (lsof + ps, off the main actor)
 
+    private nonisolated static func backendListenerPID(port: Int) async -> pid_t? {
+        await withCheckedContinuation { (cont: CheckedContinuation<pid_t?, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                cont.resume(returning: listenerPID(port: port))
+            }
+        }
+    }
+
     /// PID of an orphaned Yap backend listening on `port`: the process must be
     /// running `server.py` AND have been reparented to launchd (ppid == 1), the
     /// signature of a backend whose spawning Yap quit or crashed.
@@ -342,7 +283,7 @@ final class BackendManager: NSObject, ObservableObject {
             DispatchQueue.global(qos: .userInitiated).async {
                 guard let pid = listenerPID(port: port),
                       let info = psInfo(pid),
-                      info.ppid == 1, info.command.contains("server.py")
+                      info.uid == geteuid(), info.ppid == 1, info.command.contains("server.py")
                 else { cont.resume(returning: nil); return }
                 cont.resume(returning: pid)
             }
@@ -359,14 +300,14 @@ final class BackendManager: NSObject, ObservableObject {
         return nil
     }
 
-    /// (ppid, full command) for `pid`, via `ps`.
-    private nonisolated static func psInfo(_ pid: pid_t) -> (ppid: pid_t, command: String)? {
-        let out = runTool("/bin/ps", ["-o", "ppid=,command=", "-p", String(pid)])
+    /// Process owner, parent and command, via `ps`.
+    private nonisolated static func psInfo(_ pid: pid_t) -> (uid: uid_t, ppid: pid_t, command: String)? {
+        let out = runTool("/bin/ps", ["-o", "uid=,ppid=,command=", "-p", String(pid)])
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !out.isEmpty else { return nil }
-        let parts = out.split(separator: " ", maxSplits: 1).map(String.init)
-        guard parts.count == 2, let ppid = Int32(parts[0]) else { return nil }
-        return (ppid, parts[1])
+        let parts = out.split(maxSplits: 2, whereSeparator: \.isWhitespace)
+        guard parts.count == 3, let uid = uid_t(parts[0]), let ppid = pid_t(parts[1]) else { return nil }
+        return (uid, ppid, String(parts[2]))
     }
 
     private nonisolated static func runTool(_ path: String, _ args: [String]) -> String {
@@ -421,7 +362,7 @@ final class BackendManager: NSObject, ObservableObject {
         ownsProcess = false
     }
 
-    /// Restart the backend (e.g. after installing HD deps, to load the new env).
+    /// Restart the backend with the current provider and model settings.
     func restart() async {
         // stopAndWait (not stop + fixed sleep): wait for the old process to
         // actually exit and release port 8766 before relaunching, else the new

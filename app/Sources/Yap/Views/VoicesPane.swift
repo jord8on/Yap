@@ -17,7 +17,7 @@ struct VoicesPane: View {
     @State private var cloning = false
     @State private var pendingDelete: EngineVoice?
 
-    private var shown: String { viewing ?? prefs.engine }
+    private var shown: String { EvaluationPolicy.pocketEnabled ? (viewing ?? prefs.engine) : "kokoro" }
 
     // Not a Form: the voice list scrolls itself to the current voice, and inside
     // a Form that scroll moved the whole pane and hid the engine cards.
@@ -32,9 +32,12 @@ struct VoicesPane: View {
                     EngineCard(title: "Pocket", tagline: "Natural", detail: "26 voices · cloning",
                                icon: "sparkles", gradient: Brand.gradient,
                                selected: shown == "pocket", active: prefs.engine == "pocket",
-                               badge: state.hdInstalled ? nil : "Set up") { pick("pocket") }
+                               badge: EvaluationPolicy.pocketEnabled && !state.hdInstalled ? "Set up" : nil) { pick("pocket") }
+                        .disabled(!EvaluationPolicy.pocketEnabled)
                 }
-                Text("Both run on this Mac's CPU. Kokoro starts instantly; Pocket sounds more human and can clone a voice from a short clip.")
+                Text(EvaluationPolicy.pocketEnabled
+                     ? "Both engines run on this Mac's CPU. Pocket can clone a voice from a short clip."
+                     : EvaluationPolicy.pocketUnavailableMessage)
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -46,6 +49,10 @@ struct VoicesPane: View {
                     HStack {
                         Text(shown == "pocket" ? "Pocket voices" : "Kokoro voices").font(.headline)
                         Spacer()
+                        if shown == "kokoro", state.modelsPresent, state.voices.isEmpty {
+                            Button("Load voices") { Task { await state.loadVoiceCatalogIfNeeded() } }
+                                .disabled(state.status == .loadingModel)
+                        }
                         Button { state.testVoice() } label: { Label("Preview voice", systemImage: "play.fill") }
                             .buttonStyle(.borderless)
                             .disabled(shown != prefs.engine)
@@ -100,6 +107,7 @@ struct VoicesPane: View {
     }
 
     private func pick(_ engine: String) {
+        guard EvaluationPolicy.allowsEngine(engine) else { return }
         withAnimation(.easeOut(duration: 0.15)) { viewing = engine }
         if engine == "kokoro" || state.hdInstalled { state.selectEngine(engine) }
     }

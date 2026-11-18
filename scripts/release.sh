@@ -26,6 +26,11 @@
 # through install_local.sh and its fixed paths.
 set -euo pipefail
 
+if [ "${YAP_BUILD_SIGNING_MODE:-}" = evaluation ]; then
+  echo "release: evaluation builds are limited to workflow evidence" >&2
+  exit 1
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TAP_DIR="${YAP_TAP_DIR:-$ROOT/../homebrew-tap}"
 WORKTREE_SH="${WORKTREE_SH:-$HOME/.agents/bin/worktree.sh}"

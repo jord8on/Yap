@@ -1,9 +1,8 @@
 import Foundation
 
 /// `CFFIXED_USER_HOME=<empty dir> Yap --firstrun [port]`: a fresh install, end to
-/// end. Launch must start the Kokoro download by itself, the files must arrive and
-/// pass their pinned hashes, and the backend must reload them so the voice list is
-/// no longer empty. Pocket installed must start nothing.
+/// end. Explicit setup starts a Kokoro download, verifies the pinned hashes, and
+/// reloads the backend so the voice list fills.
 ///
 /// Downloads ~340 MB for real. Runs its own sidecar on a spare port, and refuses
 /// to run unless Application Support resolves inside the fake home, so it never
@@ -51,42 +50,22 @@ enum FirstRunProbe {
                 print("refusing: CFFIXED_USER_HOME is your real home; use an empty directory")
                 return 2
             }
-            // The Pocket case below creates and then trashes hd-packages, so it must
-            // be the probe's own: never one that was already there.
-            guard !fm.fileExists(atPath: yap.appending(path: "hd-packages").path) else {
-                print("refusing: \(yap.path) already has a Pocket install, so this is not a first run")
-                return 2
-            }
             print("First-run probe: home \(home), own sidecar on :\(port)")
 
-            AppState.probeBackendPort = port
-            // Writes no prefs: CFFIXED_USER_HOME moves Application Support but not
-            // the defaults domain, so from the signed bundle a write would land in
-            // the user's real settings. One fail cue may play.
-            guard Prefs.shared.voiceEnabled else {
-                print("refusing: Reading aloud is off, and launch only fetches a voice when it is on")
-                return 2
-            }
-            let state = AppState.shared
+            let suite = "dev.latentvariable.yap.firstrun.\(UUID().uuidString)"
+            guard let defaults = UserDefaults(suiteName: suite) else { return 2 }
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let prefs = Prefs(defaults: defaults)
+            let state = AppState(prefs: prefs, backendPort: port)
             guard !state.backend.kokoroFilesOnDisk else {
                 print("refusing: Kokoro is already in \(yap.path), so this is not a first run")
                 return 2
             }
 
-            print("Pocket installed, Kokoro missing: nothing downloads")
-            let hd = yap.appending(path: "hd-packages")
-            try? fm.createDirectory(at: hd.appending(path: "torch"), withIntermediateDirectories: true)
-            ok("Pocket reads as installed", state.backend.hdInstalledOnDisk)
-            ok("no download is reported", !state.downloadVoiceIfMissing("probe"))
-            try? await Task.sleep(for: .milliseconds(300))
-            ok("no download started", !state.downloader.downloading)
-            if hd.path.hasPrefix(yap.path + "/") { try? fm.trashItem(at: hd, resultingItemURL: nil) }
-
-            print("Nothing installed: launch fetches Kokoro and loads it")
-            ok("no voice on disk before launch",
-               !state.backend.kokoroFilesOnDisk && !state.backend.hdInstalledOnDisk)
-            await state.startVoice()
-            ok("launch started the download", await until(3) { state.kokoroDownloading })
+            ok("reading models do not load at launch by default", !prefs.autoStartVoice)
+            print("Explicit setup fetches and loads Kokoro")
+            _ = state.downloadVoiceIfMissing("first-run probe setup")
+            ok("setup started the download", await until(3) { state.kokoroDownloading })
             ok("voice list empty before the download", state.voices.isEmpty)
             guard state.kokoroDownloading else {
                 await state.backend.stopAndWait()

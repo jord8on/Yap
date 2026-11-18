@@ -1,78 +1,145 @@
 import Foundation
 import CryptoKit
+import Darwin
+import Security
 
-/// Shared secret between the app and its local backend (server.py). The sidecar
-/// binds 127.0.0.1, reachable by every local process and by `fetch()` from any
-/// website. The token closes two holes: a website CSRFing a mutating POST, and
-/// the app reusing an impostor that squatted port 8766 and then receiving
-/// captured selected text. Both sides read-or-create the same 0600 file, so a
-/// cross-user process can't read it and can't forge the token. Same-user
-/// attackers are out of scope (they already own the user's data + grants).
-enum BackendAuth {
-    /// Canonical token path. The backend defaults to this same location, and we
-    /// also pass it explicitly via `YAP_AUTH_TOKEN_FILE` when spawning.
-    static var tokenFileURL: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appending(path: "Yap/auth-token")
+/// The sidecar and client share a private bearer token and a pinned TLS identity.
+struct BackendAuth: Sendable {
+    static let local = BackendAuth(
+        tokenFileURL: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appending(path: "Yap/auth-token"),
+        migrateDefaultDirectory: true
+    )
+
+    static func proof(nonce: String) -> String? { local.proof(for: nonce) }
+
+    let tokenFileURL: URL
+    private let migrateDefaultDirectory: Bool
+
+    var bearerToken: String? {
+        Self.loadOrCreate(at: tokenFileURL, migrateDefaultDirectory: migrateDefaultDirectory)
     }
 
-    /// Cached so repeated requests don't hit disk; the file is stable per machine.
-    private static let cached: String? = loadOrCreate()
+    init(tokenFileURL: URL, migrateDefaultDirectory: Bool = false) {
+        self.tokenFileURL = tokenFileURL
+        self.migrateDefaultDirectory = migrateDefaultDirectory
+    }
 
-    /// The shared token, or nil if the file couldn't be read/created. nil means
-    /// requests go out without a Bearer header (the backend fails open on auth
-    /// in that case too), so TTS still works rather than bricking.
-    static var token: String? { cached }
-
-    private static func loadOrCreate() -> String? {
-        let url = tokenFileURL
-        let fm = FileManager.default
-        if fm.fileExists(atPath: url.path) {
-            // Refuse a token file any group/other can read or write — someone
-            // may have pre-created it (e.g. a custom path in a shared dir) to
-            // learn or fix the secret. Recreate it 0600 below.
-            let perms = ((try? fm.attributesOfItem(atPath: url.path))?[.posixPermissions] as? NSNumber)?.uint16Value
-            if let perms, perms & 0o077 != 0 {
-                Log.write("auth: token file has loose perms (\(String(perms, radix: 8))); recreating 0600")
-                try? fm.removeItem(at: url)
-            } else if let data = try? Data(contentsOf: url),
-                      let tok = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                      !tok.isEmpty {
-                return tok
+    private static func openDirectory(for url: URL, migrateDefaultDirectory: Bool = false) -> Int32? {
+        let parent = url.deletingLastPathComponent()
+        let fd = open(parent.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { return nil }
+        var info = stat()
+        if fstat(fd, &info) == 0, info.st_uid == geteuid() {
+            if info.st_mode & 0o7777 == 0o700 { return fd }
+            // Earlier Yap versions created this directory with the usual 0755 umask.
+            // Tighten the known directory by descriptor and refuse previously writable directories.
+            if migrateDefaultDirectory, info.st_mode & 0o7777 == 0o755, fchmod(fd, 0o700) == 0 {
+                return fd
             }
         }
-        // Generate 32 random bytes, base64url (no padding) — matches the
-        // backend's secrets.token_urlsafe shape closely enough; only equality
-        // across the two readers of the file matters.
-        var bytes = [UInt8](repeating: 0, count: 32)
-        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else { return nil }
-        let tok = Data(bytes).base64EncodedString()
+        close(fd)
+        return nil
+    }
+
+    private static func readPrivateFile(_ fd: Int32, maxBytes: Int) -> Data? {
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        var info = stat()
+        guard fstat(fd, &info) == 0,
+              info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+              info.st_uid == geteuid(), info.st_mode & 0o7777 == 0o600,
+              info.st_size > 0, info.st_size <= off_t(maxBytes),
+              let data = try? handle.read(upToCount: maxBytes + 1),
+              data.count == Int(info.st_size) else { return nil }
+        return data
+    }
+
+    private static func readToken(_ fd: Int32) -> String? {
+        guard let bytes = readPrivateFile(fd, maxBytes: 128),
+              let token = String(data: bytes, encoding: .ascii)?
+                .trimmingCharacters(in: CharacterSet(charactersIn: " \t\r\n")),
+              token.utf8.count == 43,
+              token.utf8.allSatisfy({
+                  (65...90).contains($0) || (97...122).contains($0) ||
+                  (48...57).contains($0) || $0 == 45 || $0 == 95
+              }) else { return nil }
+        return token
+    }
+
+    private static func loadOrCreate(at url: URL, migrateDefaultDirectory: Bool) -> String? {
+        let parent = url.deletingLastPathComponent()
+        if mkdir(parent.path, 0o700) != 0, errno != EEXIST {
+            guard errno == ENOENT,
+                  (try? FileManager.default.createDirectory(at: parent.deletingLastPathComponent(),
+                                                            withIntermediateDirectories: true)) != nil,
+                  mkdir(parent.path, 0o700) == 0 || errno == EEXIST else { return nil }
+        }
+        guard let directory = openDirectory(for: url, migrateDefaultDirectory: migrateDefaultDirectory) else {
+            return nil
+        }
+        defer { close(directory) }
+
+        let name = url.lastPathComponent
+        let readFlags = O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+        let existing = open(url.path, readFlags)
+        if existing >= 0 { return readToken(existing) }
+        guard errno == ENOENT else { return nil }
+
+        var random = [UInt8](repeating: 0, count: 32)
+        guard SecRandomCopyBytes(kSecRandomDefault, random.count, &random) == errSecSuccess else {
+            return nil
+        }
+        let token = Data(random).base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
+
+        // Write completely before publishing. linkat refuses to replace an
+        // existing entry, including a file published by a concurrent launch.
+        let temp = ".auth-token-\(UUID().uuidString)"
+        let fd = open(parent.appending(path: temp).path,
+                      O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
+        guard fd >= 0 else { return nil }
+        defer { unlinkat(directory, temp, 0) }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         do {
-            try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            guard fchmod(fd, 0o600) == 0 else { return nil }
+            try handle.write(contentsOf: Data(token.utf8))
+            try handle.close()
         } catch {
-            Log.write("auth: could not create token dir: \(error.localizedDescription)")
             return nil
         }
-        // Create the file at 0600 from the very first syscall: passing the perms
-        // to createFile means it's never world-readable, not even briefly. An
-        // atomic write+chmod would leave a window where the renamed temp sits at
-        // the default umask (0644) before chmod lands — exactly the race the
-        // Python side avoids with os.open(mode=0600).
-        guard fm.createFile(atPath: url.path, contents: Data(tok.utf8),
-                            attributes: [.posixPermissions: 0o600]) else {
-            Log.write("auth: could not create token file at \(url.path)")
-            return nil
-        }
-        return tok
+
+        if linkat(directory, temp, directory, name, 0) == 0 { return token }
+        guard errno == EEXIST else { return nil }
+        let winner = open(url.path, readFlags)
+        return winner >= 0 ? readToken(winner) : nil
     }
 
-    /// HMAC-SHA256(token, nonce) as lowercase hex — must match the backend's
-    /// /verify computation byte-for-byte.
-    static func proof(nonce: String) -> String? {
-        guard let token else { return nil }
+    /// The sidecar publishes the certificate on first launch, so read it when
+    /// URLSession receives the TLS challenge.
+    var pinnedTLSCertificateDER: Data? {
+        guard let directory = Self.openDirectory(for: tokenFileURL) else { return nil }
+        defer { close(directory) }
+        let cert = tokenFileURL.deletingLastPathComponent().appending(path: "backend-tls-cert.pem")
+        let fd = open(cert.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0, let data = Self.readPrivateFile(fd, maxBytes: 16 * 1024),
+              let pem = String(data: data, encoding: .ascii),
+              let begin = pem.range(of: "-----BEGIN CERTIFICATE-----"),
+              let end = pem[begin.upperBound...].range(of: "-----END CERTIFICATE-----") else {
+            return nil
+        }
+        let base64 = pem[begin.upperBound..<end.lowerBound].filter { !$0.isWhitespace }
+        return Data(base64Encoded: String(base64))
+    }
+
+    /// HMAC-SHA256(token, nonce) as lowercase hex, matching /verify.
+    func proof(for nonce: String) -> String? {
+        guard let bearerToken else { return nil }
+        return Self.proof(token: bearerToken, nonce: nonce)
+    }
+
+    static func proof(token: String, nonce: String) -> String {
         let key = SymmetricKey(data: Data(token.utf8))
         let mac = HMAC<SHA256>.authenticationCode(for: Data(nonce.utf8), using: key)
         return mac.map { String(format: "%02x", $0) }.joined()

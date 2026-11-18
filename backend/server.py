@@ -25,7 +25,6 @@ import logging
 import os
 import re
 import secrets
-import stat
 import sys
 import tempfile
 import threading
@@ -37,6 +36,8 @@ import numpy as np
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
+
+from local_tls import ensure_identity, private_directory, private_regular_file
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s yap %(levelname)s %(message)s")
 log = logging.getLogger("yap")
@@ -445,7 +446,16 @@ from pocket_engine import (PocketEngine, CATALOG_NAMES,
                            cloning_weights_ready, ensure_cloning_weights_stream)
 
 engine: Engine  # set in main
-pk_engine = PocketEngine()  # optional HD/cloning engine; lazy, no torch import yet
+pk_engine = PocketEngine()  # Lazy; the constructor imports no optional packages.
+
+# Evaluation policy is fixed in source. Inherited settings cannot activate Pocket.
+POCKET_ENABLED = False
+POCKET_UNAVAILABLE = "Pocket TTS is unavailable in this evaluation build"
+
+
+def require_pocket() -> None:
+    if not POCKET_ENABLED:
+        raise HTTPException(503, POCKET_UNAVAILABLE)
 
 
 class SynthReq(BaseModel):
@@ -478,59 +488,64 @@ def hd_voice_path(voice_id: str) -> Optional[Path]:
     return p if p.exists() else None
 
 
-# ---------------------------------------------------------------------------
-# Loopback auth. The sidecar binds 127.0.0.1, which is reachable by every local
-# process AND by `fetch()` from any website the user visits. Two holes that
-# closes: (1) a website CSRFing a no-body POST (e.g. the multi-GB pip install),
-# and (2) Yap reusing an impostor that squatted the port and then receiving
-# captured selected text. Defense: a shared secret in a 0600 file both the app
-# and this backend read-or-create. Every request must carry it as a Bearer
-# token; cross-user processes can't read the file, so they can't forge it. The
-# app proves a *reused* backend is genuine via /verify (HMAC challenge) before
-# trusting it. Same-user attackers are out of scope — they already own the
-# user's data and Accessibility grants.
-def _load_or_create_token() -> Optional[str]:
-    # Explicit path wins (the app passes it when spawning us); else the default
-    # app-support location, which the app uses too. A hand-started dev backend
-    # creates the file; a later app launch reads the same one.
-    path = os.environ.get("YAP_AUTH_TOKEN_FILE")
-    if not path:
-        path = str(Path.home() / "Library/Application Support/Yap/auth-token")
-    # An inline token override (env) is honored without touching disk.
-    inline = os.environ.get("YAP_AUTH_TOKEN")
-    if inline:
-        return inline.strip() or None
-    p = Path(path)
+# All HTTP requests travel over pinned loopback TLS in normal sidecar use.
+# The token authorizes requests from native clients; /verify proves possession
+# of the same secret without sending the secret in the probe.
+def _default_token_file() -> Path:
+    return Path.home() / "Library/Application Support/Yap/auth-token"
+
+
+def _load_or_create_token(path: Path) -> str:
+    def read_token(directory: int) -> str:
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     dir_fd=directory)
+        try:
+            info = os.fstat(fd)
+            if not private_regular_file(info) or not 0 < info.st_size <= 128:
+                raise RuntimeError("Yap auth token must be a private user-owned regular file")
+            with os.fdopen(fd, "rb", closefd=False) as file:
+                contents = file.read(129)
+            token = contents.strip(b" \t\r\n")
+            if len(contents) != info.st_size or re.fullmatch(rb"[A-Za-z0-9_-]{43}", token) is None:
+                raise RuntimeError("Yap auth token is malformed")
+            return token.decode("ascii")
+        finally:
+            os.close(fd)
+
     try:
-        if p.exists():
-            # Refuse a token file any group/other can access — someone may have
-            # pre-created it (e.g. a custom YAP_AUTH_TOKEN_FILE in a shared dir)
-            # to read or fix the secret. Recreate it 0600 instead of trusting it.
-            if p.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
-                # nosemgrep: python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure -- logs the file's path, never its contents
-                log.warning("auth: token file %s has loose perms; recreating 0600", p)
-                p.unlink()
-            else:
-                tok = p.read_text().strip()
-                if tok:
-                    return tok
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tok = secrets.token_urlsafe(32)
-        # Write 0600 atomically: create with restrictive mode, then write.
-        fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
-        with os.fdopen(fd, "w") as f:
-            f.write(tok)
-        os.chmod(str(p), stat.S_IRUSR | stat.S_IWUSR)
-        return tok
-    except OSError as e:
-        # Fail open on the Bearer check rather than bricking TTS, but the Origin
-        # guard below still runs, so CSRF stays closed even here.
-        # nosemgrep: python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure -- an OSError carries errno and path, never the file's contents
-        log.warning("auth: could not load/create token (%s); Bearer auth disabled", e)
-        return None
+        parent = path.parent
+        parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        with private_directory(parent, migrate_default=path == _default_token_file()) as directory:
+            try:
+                return read_token(directory)
+            except FileNotFoundError:
+                pass
+
+            token = secrets.token_urlsafe(32)
+            temp = ".auth-token-" + secrets.token_hex(16)
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o600, dir_fd=directory)
+            try:
+                with os.fdopen(fd, "wb") as file:
+                    os.fchmod(file.fileno(), 0o600)
+                    file.write(token.encode("ascii"))
+                # The final name appears only after the complete token is
+                # written. Swift uses the same protocol for competing launches.
+                try:
+                    os.link(temp, path.name, src_dir_fd=directory, dst_dir_fd=directory,
+                            follow_symlinks=False)
+                except FileExistsError:
+                    return read_token(directory)
+                return token
+            finally:
+                os.unlink(temp, dir_fd=directory)
+    except OSError as exc:
+        raise RuntimeError("Yap backend could not create or read its private auth token") from exc
 
 
-AUTH_TOKEN = _load_or_create_token()
+# Initialized by main() before starting the listener. Importing the app for
+# tests does not read or create files under the user's Application Support.
+AUTH_TOKEN: str | None = None
 
 
 def _is_browser_request(request: Request) -> bool:
@@ -556,20 +571,17 @@ async def auth_guard(request: Request, call_next):
     # probe to /verify. The native Swift client sets no Origin/Sec-Fetch-Site.
     if _is_browser_request(request):
         return JSONResponse({"detail": "cross-origin requests are not allowed"}, status_code=403)
-    # /verify self-authenticates (it returns an HMAC over a caller nonce and
-    # leaks nothing), so the app can probe an unknown listener without first
-    # handing it the token.
+    token = AUTH_TOKEN
+    if not token:
+        return JSONResponse({"detail": "authorization unavailable"}, status_code=503)
     if request.url.path == "/verify":
         return await call_next(request)
-    if AUTH_TOKEN is not None:
-        header = request.headers.get("authorization", "")
-        prefix = "Bearer "
-        presented = header[len(prefix):] if header.startswith(prefix) else ""
-        # Compare as bytes: compare_digest raises ValueError on non-ASCII str
-        # (Starlette decodes the header latin-1), which would 500 instead of a
-        # clean 401 if a client sent non-ASCII in Authorization.
-        if not presented or not hmac.compare_digest(presented.encode(), AUTH_TOKEN.encode()):
-            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    header = request.headers.get("authorization", "")
+    prefix = "Bearer "
+    presented = header[len(prefix):] if header.startswith(prefix) else ""
+    # Comparing bytes also handles non-ASCII Authorization values.
+    if not presented or not hmac.compare_digest(presented.encode(), token.encode()):
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
     return await call_next(request)
 
 
@@ -581,7 +593,7 @@ def verify(nonce: str = Query("")):
     # Cap the nonce: /verify is auth-exempt, so bound the HMAC input so a local
     # process (or a browser GET) can't DoS via an enormous nonce. A real nonce
     # is ~32 bytes base64.
-    if AUTH_TOKEN is None or not nonce or len(nonce) > 128:
+    if not AUTH_TOKEN or not nonce or len(nonce) > 128:
         raise HTTPException(400, "verification unavailable")
     proof = hmac.new(AUTH_TOKEN.encode(), nonce.encode(), hashlib.sha256).hexdigest()
     return {"proof": proof}
@@ -607,7 +619,10 @@ def engines_status() -> dict:
     return {
         "kokoro": {"name": "kokoro", "label": "Kokoro", "installed": engine.files_present(),
                    "loaded": engine.kokoro is not None},
-        "pocket": pk_engine.status(),
+        "pocket": pk_engine.status() if POCKET_ENABLED else {
+            "name": "pocket", "label": "Pocket TTS", "installed": False, "loaded": False,
+            "cloning": False, "cloning_installed": False, "error": POCKET_UNAVAILABLE,
+        },
     }
 
 
@@ -624,6 +639,7 @@ def unload_engine(name: str):
     if name == "kokoro":
         return {"unloaded": engine.unload(), "loaded": engine.kokoro is not None}
     if name == "pocket":
+        require_pocket()
         return {"unloaded": pk_engine.unload(), "loaded": pk_engine.model is not None}
     raise HTTPException(404, f"unknown engine {name!r}")
 
@@ -641,6 +657,7 @@ def pocket_install_command(target: Path) -> list[str]:
 def install_pocket():
     """Install the Pocket TTS deps into app-support hd-packages (not the bundle).
     Streams pip output so the app can show progress. ~1 GB (torch), one time."""
+    require_pocket()
     import subprocess
     from pocket_engine import hd_packages_dir
     target = hd_packages_dir()
@@ -713,6 +730,8 @@ def install_cloning_weights():
     retryable without redoing the 1 GB of deps). Streams real byte progress as the
     download runs, not a flush at the end. The caller must restart the engine afterwards: Pocket resolves its
     config once at load."""
+    require_pocket()
+
     def gen() -> Iterator[bytes]:
         if cloning_weights_ready():
             yield b"cloning weights already installed\n"
@@ -729,7 +748,14 @@ def install_cloning_weights():
 
 
 @app.get("/voices")
-def voices(engine_name: str = Query("kokoro", alias="engine")):
+def list_voices(engine_name: str = Query("kokoro", alias="engine")):
+    if engine_name == "pocket":
+        require_pocket()
+    return voices(engine_name)
+
+
+def voices(engine_name: str = "kokoro"):
+    """Enumerate voices after the route has checked evaluation policy."""
     if engine_name == "pocket":
         items = []
         # Built-in catalog speakers — always available, no account. Pocket uses
@@ -819,6 +845,7 @@ def _segment_synth(req: SynthReq):
 def warm_pocket(voice: str = Query("")):
     """Pre-load the Pocket model + a voice so the first read is fast. Called when
     the user switches to the Pocket engine."""
+    require_pocket()
     if not pk_engine.available():
         raise HTTPException(503, "Pocket engine not installed")
     # A catalog name warms directly; otherwise resolve a cloned reference clip.
@@ -896,6 +923,7 @@ assert all(
 def fetch_starter_voices():
     """Download a few clean, openly-licensed reference voices (CMU ARCTIC,
     free to use) into hd-voices. Streams progress. Uses stdlib only."""
+    require_pocket()
     import hashlib
     import urllib.request
     base = "http://festvox.org/cmu_arctic/cmu_arctic"
@@ -987,6 +1015,8 @@ STREAM_FOOTER = b"YEND"
 
 @app.post("/synthesize")
 def synthesize(req: SynthReq, format: str = Query("pcm")):
+    if req.engine == "pocket":
+        require_pocket()
     if not req.text.strip():
         raise HTTPException(400, "empty text")
 
@@ -1056,7 +1086,7 @@ def synthesize(req: SynthReq, format: str = Query("pcm")):
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1",))
     p.add_argument("--port", type=int, default=8766)
     default_models = os.environ.get("YAP_MODELS_DIR") or os.environ.get("PARLEY_MODELS_DIR") or str(
         Path.home() / "Library/Application Support/Yap/models")
@@ -1066,7 +1096,12 @@ def main() -> None:
     p.add_argument("--no-preload", action="store_true")
     args = p.parse_args()
 
-    global engine
+    global AUTH_TOKEN, engine
+    token_file = Path(os.environ.get("YAP_AUTH_TOKEN_FILE") or _default_token_file()).absolute()
+    token = _load_or_create_token(token_file)
+    cert_file, key_file = ensure_identity(token_file)
+    AUTH_TOKEN = token
+
     mdir = Path(args.models_dir).expanduser()
     mdir.mkdir(parents=True, exist_ok=True)
     engine = Engine(mdir, provider_mode=args.provider)
@@ -1074,7 +1109,7 @@ def main() -> None:
         engine.load()
 
     import uvicorn
-    log.info("serving on http://%s:%d (models: %s)", args.host, args.port, mdir)
+    log.info("serving on https://%s:%d (models: %s)", args.host, args.port, mdir)
     # KEEP_ALIVE, not a default: /synthesize is read at PLAYBACK rate.
     #
     # The app deliberately stalls its read while more than ~10s of audio is
@@ -1089,7 +1124,7 @@ def main() -> None:
     # 5s window, which is why this survived until reads got backpressured.
     # Regression probe: `Yap --tailtest <file>`.
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning",
-                timeout_keep_alive=KEEP_ALIVE)
+                timeout_keep_alive=KEEP_ALIVE, ssl_certfile=str(cert_file), ssl_keyfile=str(key_file))
 
 
 if __name__ == "__main__":

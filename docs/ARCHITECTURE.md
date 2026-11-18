@@ -233,22 +233,11 @@ Covered by `TestStreamIntegrity` (live uvicorn and raw socket): complete streams
 
 ## Backend lifecycle
 
-`BackendManager` first probes `/health`. Nothing answering means it spawns one — the bundled self-contained Python runtime directly in a shipped app, or `scripts/run_backend.sh` (venv) in a dev checkout — loads Kokoro, warms it, and serves.
+The sidecar binds to `127.0.0.1` and serves HTTPS using a private per-user TLS identity. The client pins the certificate on the connection that sends the bearer credential and speech text. It also checks a nonce-bound HMAC from `/verify`. Browser-originated requests and missing credentials are refused. Same-user processes with access to the private identity files are outside this protection.
 
-Something already answering is not automatically reused. `start()` decides:
+When the port is free, `BackendManager` starts the embedded Python runtime in a packaged build or `scripts/run_backend.sh` in a development checkout. The packaged launcher suppresses bytecode writes into the signed bundle.
 
-- **Unverified** (`verifyAuthentic()` fails — it can't prove it knows the shared secret). An identifiable Yap orphan (a `server.py` reparented to launchd, ppid 1) is almost always a stale pre-auth backend left over from an upgrade, so it's killed and a fresh authenticated one launched. Anything else is a foreign listener squatting the port: refused with an error, never handed captured text.
-- **Verified and ready** — reused.
-- **Verified but not ready** (responding, no model it can serve). If it's an adopted orphan, it's stopped and relaunched; if it's external, it's left alone and `start()` bails rather than racing a second process onto the same port.
-
-A verified reuse also splits on **who started it**:
-
-- **Orphaned Yap backend** — **adopted**: `ownsProcess = true`. The app can stop and relaunch it, so model management keeps working across an app restart.
-- **Hand-started external server** (a dev backend in a terminal, ppid != 1) — left external: `ownsProcess = false`. It isn't ours to kill.
-
-So `ownsProcess` means "we may end this process", not "we spawned it".
-
-`ready` means the backend can serve *some* engine: Kokoro loaded **or** the Pocket engine present on disk. So deleting one model doesn't make the backend look dead, and `waitForHealth()` fails fast (instead of polling 60s) when a model will never load. Kokoro presence is tracked separately as `kokoroFilesPresent`.
+An unverified listener blocks startup. Process names alone cannot authorize adopting or stopping it. A verified backend can be reused. Process ownership checks govern stopping and restarting it. In the evaluation, readiness requires a usable Kokoro engine. Kokoro's on-disk files are tracked separately as `kokoroFilesPresent`.
 
 Model management (Models tab) leans on both: delete is only offered when `ownsProcess` is true (an external backend can't be stopped to release the model files), and a delete does `stopAndWait()` → remove files → `start()` so disk is freed and the relaunched process reflects the change.
 

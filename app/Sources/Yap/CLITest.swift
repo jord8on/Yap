@@ -147,8 +147,7 @@ extension CLITest {
         if cleaned.count > maxChars { cleaned = String(cleaned.prefix(maxChars)) }
         print("── tail probe  chars=\(cleaned.count)  cap=\(AudioPlayer.maxQueuedSeconds)s")
         Task {
-            var client = BackendClient()
-            client.base = URL(string: "http://127.0.0.1:\(port)")!
+            let client = BackendClient(base: URL(string: "https://127.0.0.1:\(port)")!)
 
             // Reference: one non-streamed render of the same text. Any shortfall
             // against this is bytes the stream never delivered.
@@ -333,15 +332,27 @@ extension CLITest {
             let server = fixture.appending(path: "fake_backend.py")
             let pidFile = fixture.appending(path: "backend.pid")
             let startsFile = fixture.appending(path: "starts")
-            let models = fixture.appending(path: "models")
+            let support = fixture.appending(path: "support")
             let launcher = scripts.appending(path: "run_backend.sh")
             do {
+                try fm.createDirectory(at: fixture, withIntermediateDirectories: false,
+                                       attributes: [.posixPermissions: 0o700])
                 try fm.createDirectory(at: scripts, withIntermediateDirectories: true)
-                try fm.createDirectory(at: models, withIntermediateDirectories: true)
                 let python = #"""
-                import http.server, json, os, sys
+                import hashlib, hmac, http.server, json, os, ssl, subprocess, sys, urllib.parse
+                from pathlib import Path
 
-                port, pid_file, starts_file, models_dir = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+                port, pid_file, starts_file = int(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+                models_dir = os.environ["YAP_MODELS_DIR"]
+                assert sys.dont_write_bytecode and sys.flags.no_user_site
+                assert os.environ["PYTHONDONTWRITEBYTECODE"] == os.environ["PYTHONNOUSERSITE"] == "1"
+                assert all(key not in os.environ for key in (
+                    "PYTHONPATH", "HF_TOKEN", "PARLEY_HD_DIR", "YAP_POCKET_ENABLED"
+                ))
+                with open(os.environ["YAP_AUTH_TOKEN_FILE"], encoding="utf-8") as f:
+                    token = f.read().strip()
+                assert len(token) == 43
+                assert Path(models_dir).parent == Path(os.environ["YAP_AUTH_TOKEN_FILE"]).parent
                 try:
                     with open(starts_file) as f:
                         starts = int(f.read()) + 1
@@ -354,42 +365,90 @@ extension CLITest {
 
                 class Handler(http.server.BaseHTTPRequestHandler):
                     def do_GET(self):
-                        if self.path != "/health":
+                        parsed = urllib.parse.urlsplit(self.path)
+                        if parsed.path == "/verify":
+                            if self.headers.get("Authorization") is not None:
+                                self.send_error(400)
+                                return
+                            nonce = urllib.parse.parse_qs(parsed.query).get("nonce", [""])[0]
+                            if not nonce or len(nonce) > 128:
+                                self.send_error(400)
+                                return
+                            proof = hmac.new(token.encode(), nonce.encode(), hashlib.sha256).hexdigest()
+                            body = json.dumps({"proof": proof}).encode()
+                        elif parsed.path == "/health":
+                            if self.headers.get("Authorization") != "Bearer " + token:
+                                self.send_error(401)
+                                return
+                            body = json.dumps({
+                                "status": "ok", "model_loaded": True, "files_present": True,
+                                "models_dir": models_dir, "error": None, "sample_rate": 24000,
+                                "provider_mode": "cpu", "active_providers": ["CPUExecutionProvider"],
+                                "available_providers": ["CPUExecutionProvider"]
+                            }).encode()
+                        else:
                             self.send_error(404)
                             return
-                        body = json.dumps({
-                            "status": "ok", "model_loaded": True, "files_present": True,
-                            "models_dir": models_dir, "error": None, "sample_rate": 24000,
-                            "provider_mode": "cpu", "active_providers": ["CPUExecutionProvider"],
-                            "available_providers": ["CPUExecutionProvider"]
-                        }).encode()
                         self.send_response(200)
                         self.send_header("Content-Type", "application/json")
                         self.send_header("Content-Length", str(len(body)))
                         self.end_headers()
                         self.wfile.write(body)
+
                     def log_message(self, *_):
                         pass
 
                 class Server(http.server.ThreadingHTTPServer):
                     allow_reuse_address = True
 
-                Server(("127.0.0.1", port), Handler).serve_forever()
+                cert_dir = Path(os.environ["YAP_AUTH_TOKEN_FILE"]).parent
+                cert = cert_dir / "backend-tls-cert.pem"
+                key = cert_dir / "backend-tls-key.pem"
+                if not cert.exists():
+                    config = cert_dir / "openssl.cnf"
+                    config.write_text(
+                        "[req]\nprompt=no\ndistinguished_name=dn\nx509_extensions=tls\n"
+                        "[dn]\nCN=127.0.0.1\n[tls]\nsubjectAltName=IP:127.0.0.1\n"
+                    )
+                    subprocess.run(
+                        ["/usr/bin/openssl", "req", "-x509", "-newkey", "rsa:2048",
+                         "-nodes", "-days", "1", "-config", str(config),
+                         "-keyout", str(key), "-out", str(cert)],
+                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        umask=0o077,
+                    )
+                    os.chmod(key, 0o600)
+                    os.chmod(cert, 0o600)
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                context.load_cert_chain(certfile=str(cert), keyfile=str(key))
+                httpd = Server(("127.0.0.1", port), Handler)
+                httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+                httpd.serve_forever()
                 """#
-                let script = "#!/bin/bash\nexec python3 \(shellQuote(server.path)) \"$YAP_PORT\" \(shellQuote(pidFile.path)) \(shellQuote(startsFile.path)) \(shellQuote(models.path))\n"
+                let script = "#!/bin/bash\nexec /usr/bin/python3 -B -E -s \(shellQuote(server.path)) \"$YAP_PORT\" \(shellQuote(pidFile.path)) \(shellQuote(startsFile.path))\n"
                 try Data(python.utf8).write(to: server)
                 try Data(script.utf8).write(to: launcher)
             } catch {
                 print("✗ could not prepare recovery fixture: \(error.localizedDescription)")
-                try? fm.trashItem(at: fixture, resultingItemURL: nil)
+                try? fm.removeItem(at: fixture)
                 exit(1)
             }
 
-            let manager = BackendManager(port: port, repoRootOverride: fixture)
+            // Seed test-only overrides after app initialization. The actual child
+            // environment must drop these on each launch.
+            setenv("PYTHONPATH", fixture.path, 1)
+            setenv("HF_TOKEN", "fixture-canary", 1)
+            setenv("YAP_POCKET_ENABLED", "1", 1)
+            setenv("PARLEY_HD_DIR", fixture.path, 1)
+            let manager = BackendManager(port: port, repoRootOverride: fixture,
+                                         supportDirectoryOverride: support)
             @MainActor func finish(_ message: String, _ code: Int32) async -> Never {
                 await manager.stopAndWait()
-                do { try fm.trashItem(at: fixture, resultingItemURL: nil) }
-                catch { print("   · could not trash temporary fixture: \(error.localizedDescription)") }
+                if code != 0,
+                   let log = try? String(contentsOf: support.appending(path: "yap_backend.log"), encoding: .utf8) {
+                    print(log)
+                }
+                try? fm.removeItem(at: fixture)
                 print(message)
                 exit(code)
             }

@@ -29,20 +29,19 @@ final class AgentAPIController {
         self.socketPath = socketPath
     }
 
-    /// Follow the pref: `$agentAPIEnabled` emits its current value on subscribe,
-    /// so this also starts the server at launch.
+    /// Start only after opt-in, then follow changes to the preference.
     func bootstrap() {
-        cancellable = prefs.$agentAPIEnabled.removeDuplicates().sink { [weak self] on in
+        if prefs.agentAPIEnabled { start() } else { stop() }
+        cancellable = prefs.$agentAPIEnabled.removeDuplicates().dropFirst().sink { [weak self] _ in
             // @Published fires in willSet; hop so `prefs` already holds the new value.
-            Task { @MainActor in self?.apply(on) }
+            Task { @MainActor in
+                guard let self else { return }
+                if self.prefs.agentAPIEnabled { self.start() } else { self.stop() }
+            }
         }
     }
 
-    func apply(_ enabled: Bool) {
-        if enabled { start() } else { stop() }
-    }
-
-    func start() {
+    private func start() {
         guard server == nil else { return }
         let s = AgentServer(path: socketPath) { [weak self] req in
             guard let self else { return HTTPResponse.error(APIError(503, "shutting_down", "Yap is quitting.")) }
@@ -67,7 +66,10 @@ final class AgentAPIController {
 
     // MARK: routes
 
+    private static let apiDisabled = APIError(403, "api_disabled", "The agent API is turned off in Yap's settings.")
+
     func handle(_ req: HTTPRequest) async -> HTTPResponse {
+        guard prefs.agentAPIEnabled else { return .error(Self.apiDisabled) }
         let route: AgentRoute
         switch AgentAPI.route(method: req.method, path: req.path) {
         case .failure(let e): return .error(e)
@@ -75,7 +77,10 @@ final class AgentAPIController {
         }
         switch route {
         case .status: return .json(statusObject())
-        case .voices: return .json(voicesObject())
+        case .voices:
+            if prefs.voiceEnabled { await state.loadVoiceCatalogIfNeeded() }
+            guard prefs.agentAPIEnabled else { return .error(Self.apiDisabled) }
+            return .json(voicesObject())
         case .speak: return await speak(req)
         case .stop:
             let was = state.status
@@ -106,6 +111,10 @@ final class AgentAPIController {
         switch AgentAPI.parseSpeak(req.body) {
         case .failure(let e): return .error(e)
         case .success(let v): r = v
+        }
+        if (r.voice != nil || r.engine != nil), r.engine != "pocket", r.voice?.hasPrefix("pocket:") != true {
+            await state.loadVoiceCatalogIfNeeded()
+            guard prefs.agentAPIEnabled else { return .error(Self.apiDisabled) }
         }
         let options = AppState.SpeakOptions(engine: r.engine, voice: r.voice, speed: r.speed, clean: r.clean)
         let ticket: AppState.SpeakTicket

@@ -209,7 +209,8 @@ struct MenuContent: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
                     VoiceMenuButton(voices: state.combinedVoices, selectionId: state.currentVoiceId,
-                                    engine: prefs.engine, pocketAvailable: state.hdInstalled,
+                                    engine: prefs.engine,
+                                    pocketAvailable: EvaluationPolicy.pocketEnabled && state.hdInstalled,
                                     onSelectEngine: { state.selectEngine($0) }) {
                         state.selectVoice($0)
                     }

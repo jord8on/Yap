@@ -29,7 +29,7 @@ enum Status: Equatable {
 
 @MainActor
 final class AppState: ObservableObject {
-    static let shared = AppState()
+    static let shared = AppState(prefs: .shared)
 
     @Published var status: Status = .idle
     @Published var voices: [VoiceInfo] = []
@@ -68,7 +68,9 @@ final class AppState: ObservableObject {
         var out: [EngineVoice] = voices.map {
             EngineVoice(engine: "kokoro", voiceId: $0.id, label: $0.shortName, section: $0.lang_label)
         }
-        if hdInstalled { out += AppState.pocketVoices(hdVoices, cloningReady: cloningReady) }
+        if EvaluationPolicy.pocketEnabled && hdInstalled {
+            out += AppState.pocketVoices(hdVoices, cloningReady: cloningReady)
+        }
         return out
     }
 
@@ -98,8 +100,8 @@ final class AppState: ObservableObject {
     /// this is the belt-and-braces half, so no other call path can park the app on
     /// a selection the backend will 403 and `refreshHD` will silently demote.
     func selectVoice(_ v: EngineVoice) {
-        guard v.available else { return }
-        prefs.engine = v.engine
+        guard v.available, EvaluationPolicy.allowsEngine(v.engine) else { return }
+        prefs.selectEngine(v.engine)
         if v.engine == "pocket" { prefs.hdVoice = v.voiceId } else { prefs.voice = v.voiceId }
     }
 
@@ -108,11 +110,11 @@ final class AppState: ObservableObject {
     /// selected (Pocket defaults to a catalog voice). Switching to Pocket warms it
     /// via the prefs.$engine subscriber.
     func selectEngine(_ e: String) {
-        guard e != prefs.engine else { return }
+        guard EvaluationPolicy.allowsEngine(e), e != prefs.engine else { return }
         if e == "pocket", prefs.hdVoice.isEmpty, let v = defaultPocketVoiceId {
             prefs.hdVoice = v
         }
-        prefs.engine = e
+        prefs.selectEngine(e)
     }
 
     /// The voice a first-time Pocket switch lands on. Prefer **Eve** (catalog,
@@ -125,12 +127,9 @@ final class AppState: ObservableObject {
             ?? hdVoices.first?.id
     }
 
-    let prefs = Prefs.shared
-    /// Probe-only (`--apitest`): run against a backend of the probe's own, on a
-    /// spare port, so a probe never touches the one the running app owns. Set
-    /// before first use of `shared`.
-    static var probeBackendPort: Int?
-    let backend = BackendManager(port: AppState.probeBackendPort ?? 8766)
+    let prefs: Prefs
+    let backend: BackendManager
+    private let history: HistoryStore?
     let audio = AudioPlayer()
     let hotkey = HotKeyManager()
     /// Owned here (not in the Settings view) so a Kokoro download keeps running
@@ -200,12 +199,10 @@ final class AppState: ObservableObject {
     private var resetToIdleTask: Task<Void, Never>? // single in-flight error->idle timer
     private var cancellables = Set<AnyCancellable>()
 
-    private init() {
-        // Port pre-rename state before backend.modelsDir (below) creates a fresh
-        // Yap directory. runOnce() is idempotent, so calling it here too — rather
-        // than relying on Prefs being initialized first by declaration order — keeps
-        // correctness independent of stored-property ordering.
-        AppMigration.runOnce()
+    init(prefs: Prefs, backendPort: Int = 8766, history: HistoryStore? = nil) {
+        self.prefs = prefs
+        self.history = history
+        backend = BackendManager(port: backendPort)
         downloader = ModelDownloader(modelsDir: backend.modelsDir)
         hotkey.onFire = { [weak self] in self?.triggerRead() }
         TextCapture.trackFrontApp()
@@ -236,20 +233,17 @@ final class AppState: ObservableObject {
         downloader.$done.removeDuplicates().filter { $0 }.sink { [weak self] _ in
             self?.reloadAfterKokoroDownload()
         }.store(in: &cancellables)
-        // Turning reading on later is the same first run as a launch with it on.
-        prefs.$voiceEnabled.dropFirst().removeDuplicates().filter { $0 }.sink { [weak self] _ in
-            self?.downloadVoiceIfMissing("reading turned on")
-        }.store(in: &cancellables)
     }
 
-    /// No voice can speak until one is on disk, so with neither Kokoro nor Pocket
-    /// installed, fetch Kokoro (~340 MB, pinned SHA-256) without waiting for a
-    /// click. Pocket installed means the user can already speak, and may have
-    /// deleted Kokoro on purpose, so it is left alone. Returns whether a download
-    /// is running.
+    private var hasVoiceOnDisk: Bool {
+        backend.kokoroFilesOnDisk || (EvaluationPolicy.pocketEnabled && backend.hdInstalledOnDisk)
+    }
+
+    /// Fetch Kokoro when reading is requested or launch loading is opted in.
+    /// Return whether a download is running.
     @discardableResult
     func downloadVoiceIfMissing(_ why: String) -> Bool {
-        guard !backend.kokoroFilesOnDisk, !backend.hdInstalledOnDisk, !deletingKokoro else {
+        guard !hasVoiceOnDisk, !deletingKokoro else {
             return downloader.downloading
         }
         if !downloader.downloading {
@@ -265,6 +259,7 @@ final class AppState: ObservableObject {
     /// Pocket pre-loaded ("Pre-load Pocket at launch"), don't offload it while on
     /// Kokoro — that toggle explicitly trades memory for zero cold start.
     func offloadInactiveEngine(activeEngine: String? = nil) {
+        guard EvaluationPolicy.pocketEnabled else { return }
         // The $engine sink fires inside `willSet`, where `prefs.engine` still holds
         // the OLD value — so that caller passes the new engine explicitly. Other
         // callers (deferred Tasks, post-warm) run after the store and can read it.
@@ -290,7 +285,7 @@ final class AppState: ObservableObject {
     func warmHD() {
         // Don't warm during playback — the backend serializes model access, but
         // warming mid-read would just stall the read behind a throwaway generate.
-        guard hdInstalled, !warming, status != .reading, status != .paused else { return }
+        guard EvaluationPolicy.pocketEnabled, hdInstalled, !warming, status != .reading, status != .paused else { return }
         warming = true
         let voice = prefs.hdVoice
         Task {
@@ -392,8 +387,11 @@ final class AppState: ObservableObject {
     }
 
     func bootstrap() {
-        seedStarterVoices()
-        repairHDVoiceIDs()
+        if EvaluationPolicy.pocketEnabled {
+            seedStarterVoices()
+            repairHDVoiceIDs()
+        }
+        modelsPresent = backend.kokoroFilesOnDisk
         reapplyHotKey()   // honors voiceEnabled — won't bind the hot key when reading is off
         Log.write("bootstrap: axTrusted=\(Permissions.axTrusted) readSource=\(prefs.readSource.rawValue) captureMode=\(prefs.captureMode.rawValue) voiceEnabled=\(prefs.voiceEnabled)")
         // Selection capture needs Accessibility. Prompt up front so the user
@@ -414,15 +412,15 @@ final class AppState: ObservableObject {
                 if trusted != self.axTrusted { self.axTrusted = trusted }
             }
         }
-        Task { await startVoice() }
+        if prefs.voiceEnabled && prefs.autoStartVoice {
+            Task { await startVoice(downloadIfMissing: true) }
+        }
         restoreCachedUpdate()
         maybeAutoCheckForUpdates()
     }
 
-    /// The voice half of launch: bring the backend up, read what it has, and on a
-    /// first run fetch a voice. Its own function so `--firstrun` drives this exact
-    /// path without the hotkey, permission prompts and timers of `bootstrap`.
-    func startVoice() async {
+    /// Load the voice on request or through the launch opt-in.
+    func startVoice(downloadIfMissing: Bool = false) async {
         status = .loadingModel
         await backend.start()
         let health = await backend.client.health()
@@ -432,7 +430,15 @@ final class AppState: ObservableObject {
         voices = await backend.client.voices()
         refreshHD()
         status = backend.ready ? .idle : .error(backend.lastError ?? "Backend not ready")
-        if prefs.voiceEnabled { downloadVoiceIfMissing("launch") }
+        if downloadIfMissing { downloadVoiceIfMissing("launch") }
+    }
+
+    func loadVoiceCatalogIfNeeded() async {
+        guard voices.isEmpty, !deletingKokoro, backend.kokoroFilesOnDisk else { return }
+        if backend.needsStart { await backend.start() }
+        guard backend.ready, !deletingKokoro else { return }
+        modelsPresent = backend.kokoroFilesPresent
+        voices = await backend.client.voices()
     }
 
     // MARK: - update awareness
@@ -448,7 +454,7 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// Fire the once/day auto-check if the user hasn't opted out and a day has
+    /// Fire the once/day auto-check if the user has opted in and a day has
     /// passed. Silent — a found update surfaces as a menu banner, nothing else.
     func maybeAutoCheckForUpdates() {
         guard prefs.autoUpdateCheck else { return }
@@ -537,9 +543,8 @@ final class AppState: ObservableObject {
         // No voice installed at all (fresh install, nothing downloaded): say so now.
         // Otherwise the read captures text, fails inside the backend, and the only
         // sign is a menu-bar pill nobody is looking at while they press ⌘⇧R.
-        // Checked on disk, not via modelsPresent/hdInstalled: those start false and
-        // stay false until the backend answers, which would reject launch-time reads.
-        if !wasPlaying, !backend.kokoroFilesOnDisk, !backend.hdInstalledOnDisk {
+        // Check disk directly so a cold backend can still read with installed files.
+        if !wasPlaying, !hasVoiceOnDisk {
             Log.write("read aborted: no voice model installed (Settings ▸ Models)")
             // A launch download that failed (offline, say) gets another try here.
             refusePress(downloadVoiceIfMissing("read pressed")
@@ -687,7 +692,10 @@ final class AppState: ObservableObject {
             engine = e
             voice = String(v[v.index(after: colon)...])
         }
-        let eff = engine ?? prefsEngine
+        let eff = engine ?? (EvaluationPolicy.allowsEngine(prefsEngine) ? prefsEngine : "kokoro")
+        guard EvaluationPolicy.allowsEngine(eff) else {
+            return .failure(APIError(400, "engine_unavailable", EvaluationPolicy.pocketUnavailableMessage))
+        }
         let speed = o.speed ?? prefsSpeed
         let overridden = engine != nil || voice != nil
         let id = voice ?? (eff == "pocket" ? prefsHDVoice : prefsVoice)
@@ -863,13 +871,15 @@ final class AppState: ObservableObject {
                 return
             }
         }
+        await loadVoiceCatalogIfNeeded()
+        guard gen == generation else { return }
 
         let p = params ?? ReadParams(engine: prefs.engine, voice: activeVoice, speed: prefs.speed)
         playingText = cleaned
         lastReadCleaned = cleaned   // remember for the stale-selection guard (covers Services reads too)
         // Log what we're about to speak (both hotkey + Services reads land here,
         // past the empty/failed-capture guards) so it's recoverable from History.
-        HistoryStore.shared.recordSpoken(cleaned,
+        (history ?? .shared).recordSpoken(cleaned,
             detail: "\(p.engine == "pocket" ? "Pocket" : "Kokoro") · \(p.voice)\(speakID == nil ? "" : " · agent")")
         status = .reading
         preparing = true   // first audio not here yet (Pocket cold-load takes a moment)
@@ -1077,6 +1087,7 @@ final class AppState: ObservableObject {
     @Published var installingCloning = false // fetch in flight
 
     func refreshHD() {
+        guard EvaluationPolicy.pocketEnabled else { return }
         Task {
             let e = await backend.client.engines()
             hdInstalled = e.pocket?.installed ?? false
@@ -1194,12 +1205,13 @@ final class AppState: ObservableObject {
     /// back to Kokoro if Pocket was the active engine. Re-installable from this tab
     /// or Settings ▸ Voices. Callers should confirm first.
     func deleteHDModel() {
+        guard EvaluationPolicy.pocketEnabled else { return }
         guard backend.ownsProcess else { return }  // unsafe against a reused backend
         guard !deletingKokoro, !deletingHD else { return }  // one delete at a time
         stop()                  // stop playback
         deletingHD = true       // block install/re-trigger until the bounce finishes
         hdInstalled = false     // reflect immediately
-        if prefs.engine == "pocket" { prefs.engine = "kokoro" }
+        if prefs.engine == "pocket" { prefs.selectEngine("kokoro") }
         let dir = hdPackagesDir
         // The cloning weights are Pocket's too, so "delete Pocket to reclaim disk"
         // has to take them: leaving 209 MB behind is exactly the disk the user was
@@ -1239,6 +1251,10 @@ final class AppState: ObservableObject {
     /// callers can flip their own UI flags on completion instead of scraping the
     /// log text.
     func installHD(onLine: @escaping (String) -> Void) async {
+        guard EvaluationPolicy.pocketEnabled else {
+            onLine(EvaluationPolicy.pocketUnavailableMessage)
+            return
+        }
         guard !installingHD else { return }   // one install at a time
         installingHD = true
         defer { installingHD = false }
@@ -1263,6 +1279,10 @@ final class AppState: ObservableObject {
     /// at load, so a running engine that started without the weights stays without
     /// them until it reloads.
     func installCloningWeights(onLine: @escaping (String) -> Void) async {
+        guard EvaluationPolicy.pocketEnabled else {
+            onLine(EvaluationPolicy.pocketUnavailableMessage)
+            return
+        }
         guard !installingCloning else { return }   // one fetch at a time
         installingCloning = true
         defer { installingCloning = false }
@@ -1303,6 +1323,10 @@ final class AppState: ObservableObject {
     /// `onDone` gets the new voice's id once it is saved and selected, or nil
     /// when the import failed, so the Clone sheet can offer a preview.
     func addHDVoice(from src: URL, name: String, onDone: (@MainActor (String?) -> Void)? = nil) {
+        guard EvaluationPolicy.pocketEnabled else {
+            onDone?(nil)
+            return
+        }
         guard let safe = VoiceID.slug(name) else {
             status = .error("Voice name needs a letter or number")
             onDone?(nil)
@@ -1342,6 +1366,10 @@ final class AppState: ObservableObject {
     }
 
     func fetchStarterVoices(onLine: @escaping (String) -> Void) {
+        guard EvaluationPolicy.pocketEnabled else {
+            onLine(EvaluationPolicy.pocketUnavailableMessage)
+            return
+        }
         Task {
             do { try await backend.client.fetchStarterVoices { l in Task { @MainActor in onLine(l) } } }
             catch { onLine("error: \(error.localizedDescription)") }
@@ -1353,6 +1381,7 @@ final class AppState: ObservableObject {
     /// To the Trash, not a real delete: a cloned voice is the user's own
     /// recording, the one thing here nothing can download again.
     func deleteHDVoice(_ id: String) {
+        guard EvaluationPolicy.pocketEnabled else { return }
         try? FileManager.default.trashItem(at: hdVoicesDir.appending(path: "\(id).wav"), resultingItemURL: nil)
         refreshHD()
     }

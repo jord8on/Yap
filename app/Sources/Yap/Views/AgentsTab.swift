@@ -52,7 +52,7 @@ struct AgentsTab: View {
 
             Section {
                 Toggle("Let agents use Yap", isOn: $prefs.agentAPIEnabled)
-                Text("Programs on this Mac can ask Yap to speak, pause or stop, through a private socket in Application Support. No web page and no other user can reach it.")
+                Text("Off by default. When enabled, programs running as you can ask Yap to speak, pause or stop through a local socket in Application Support.")
                     .font(.caption).foregroundStyle(.secondary)
                 Toggle("Allow agents to listen", isOn: $prefs.agentListenEnabled)
                     .disabled(!prefs.agentAPIEnabled)

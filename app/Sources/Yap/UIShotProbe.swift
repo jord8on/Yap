@@ -19,12 +19,8 @@ enum UIShotProbe {
         app.setActivationPolicy(.accessory)
         let out = URL(fileURLWithPath: dir, isDirectory: true)
         try? FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
-        // Sample history, set before anything touches HistoryStore.shared: the
-        // History pane must never photograph the user's real dictation.
-        let sample = FileManager.default.temporaryDirectory.appending(path: "yap-uishot-history-\(getpid()).json")
-        try? sampleHistory().write(to: sample)
-        setenv("YAP_HISTORY_FILE", sample.path, 1)
         Task { @MainActor in
+            let history = makeSampleHistory()
             let state = AppState.shared
             let prefs = Prefs.shared
             state.modelsPresent = true
@@ -54,10 +50,12 @@ enum UIShotProbe {
                     .padding(20).background(Color(nsColor: .windowBackgroundColor))
                 if await shoot(notice, width: 380, height: nil, look: look,
                                to: out.appending(path: "notice-\(suffix).png")) { written += 1 }
-                let sheet = CloneVoiceSheet().environmentObject(state).environmentObject(prefs)
-                    .background(Color(nsColor: .windowBackgroundColor))
-                if await shoot(sheet, width: 480, height: nil, look: look,
-                               to: out.appending(path: "clone-sheet-\(suffix).png")) { written += 1 }
+                if EvaluationPolicy.pocketEnabled {
+                    let sheet = CloneVoiceSheet().environmentObject(state).environmentObject(prefs)
+                        .background(Color(nsColor: .windowBackgroundColor))
+                    if await shoot(sheet, width: 480, height: nil, look: look,
+                                   to: out.appending(path: "clone-sheet-\(suffix).png")) { written += 1 }
+                }
                 // The Agents pane runs past the window; shoot all of it once.
                 let agents = AgentsTab().environmentObject(state).environmentObject(prefs)
                     .frame(width: 640, height: 1180).background(Color(nsColor: .windowBackgroundColor))
@@ -65,15 +63,15 @@ enum UIShotProbe {
                                to: out.appending(path: "agents-full-\(suffix).png")) { written += 1 }
                 for pane in SettingsTab.allCases {
                     UserDefaults.standard.set(pane.rawValue, forKey: "settingsPane")
-                    // The Voices pane looks different per engine: shoot both.
-                    for engine in pane == .voice ? ["kokoro", "pocket"] : [prefs.engine] {
+                    let engines = pane == .voice && EvaluationPolicy.pocketEnabled ? ["kokoro", "pocket"] : [prefs.engine]
+                    for engine in engines {
                         let was = prefs.engine
-                        prefs.engine = engine
+                        prefs.selectEngine(engine)
                         let name = pane == .voice ? "\(pane.rawValue)-\(engine)" : pane.rawValue
-                        let view = SettingsView().environmentObject(state).environmentObject(prefs)
+                        let view = SettingsView(history: history).environmentObject(state).environmentObject(prefs)
                         if await shoot(view, width: 860, height: 620, look: look,
                                        to: out.appending(path: "settings-\(name)-\(suffix).png")) { written += 1 }
-                        prefs.engine = was
+                        prefs.selectEngine(was)
                     }
                 }
             }
@@ -82,6 +80,12 @@ enum UIShotProbe {
         }
         app.run()
         exit(1)
+    }
+
+    @MainActor private static func makeSampleHistory() -> HistoryStore {
+        let sample = FileManager.default.temporaryDirectory.appending(path: "yap-uishot-history-\(UUID().uuidString).json")
+        try? sampleHistory().write(to: sample)
+        return HistoryStore(fileURL: sample, recordingEnabled: { false })
     }
 
     private static func sampleHistory() -> Data {
@@ -110,12 +114,10 @@ enum UIShotProbe {
     static func hold(pane: String, seconds: Double) -> Never {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
-        let sample = FileManager.default.temporaryDirectory.appending(path: "yap-uishot-history-\(getpid()).json")
-        try? sampleHistory().write(to: sample)
-        setenv("YAP_HISTORY_FILE", sample.path, 1)
         Task { @MainActor in
             UserDefaults.standard.set(pane, forKey: "settingsPane")
-            let view = SettingsView().environmentObject(AppState.shared).environmentObject(Prefs.shared)
+            let view = SettingsView(history: makeSampleHistory())
+                .environmentObject(AppState.shared).environmentObject(Prefs.shared)
             let host = NSHostingView(rootView: view)
             let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 860, height: 620),
                                   styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)

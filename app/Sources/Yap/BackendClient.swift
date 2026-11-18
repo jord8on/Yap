@@ -1,4 +1,42 @@
 import Foundation
+import Security
+
+/// Certificate-pinned transport. TLS proves the listener's identity on the
+/// SAME connection that carries headers and payload. A squatter which takes
+/// the port between /verify and /synthesize has no private TLS key and never
+/// receives an HTTP Bearer token or user text.
+private final class PinnedYapTLSDelegate: NSObject, URLSessionTaskDelegate {
+    private let auth: BackendAuth
+
+    init(auth: BackendAuth) {
+        self.auth = auth
+    }
+
+    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              challenge.protectionSpace.host == "127.0.0.1",
+              challenge.protectionSpace.protocol == "https",
+              let trust = challenge.protectionSpace.serverTrust,
+              let chain = SecTrustCopyCertificateChain(trust) as? [SecCertificate],
+              let leaf = chain.first,
+              let expected = auth.pinnedTLSCertificateDER,
+              (SecCertificateCopyData(leaf) as Data) == expected else {
+            completionHandler(.cancelAuthenticationChallenge, nil)
+            return
+        }
+        completionHandler(.useCredential, URLCredential(trust: trust))
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        // No backend endpoint ever redirects. A malicious listener must not
+        // redirect an authenticated request (and selected text) to a new host.
+        completionHandler(nil)
+    }
+}
 
 struct VoiceInfo: Identifiable, Decodable, Hashable {
     let id: String
@@ -25,30 +63,61 @@ struct HealthInfo: Decodable {
 }
 
 /// Thin HTTP client for the local Kokoro backend.
-struct BackendClient {
-    var base = URL(string: "http://127.0.0.1:8766")!
-    // One reused session — a computed property would spin up (and leak) a fresh
-    // URLSession, with its own connection pool + delegate thread, on every call.
-    private let session: URLSession = {
-        let cfg = URLSessionConfiguration.default
+final class BackendClient: Sendable {
+    private let base: URL
+    private let auth: BackendAuth
+    private let session: URLSession
+
+    init(base: URL = URL(string: "https://127.0.0.1:8766")!, auth: BackendAuth = .local) {
+        self.base = base
+        self.auth = auth
+        let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 600
         cfg.waitsForConnectivity = false
-        return URLSession(configuration: cfg)
-    }()
+        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
+        cfg.urlCache = nil
+        cfg.httpShouldSetCookies = false
+        cfg.httpCookieStorage = nil
+        cfg.urlCredentialStorage = nil
+        cfg.connectionProxyDictionary = [:]
+        cfg.tlsMinimumSupportedProtocolVersion = .TLSv12
+        session = URLSession(configuration: cfg, delegate: PinnedYapTLSDelegate(auth: auth), delegateQueue: nil)
+    }
 
-    /// Build a request already carrying the shared-secret Bearer token. Every
-    /// call to the backend goes through this — the sidecar rejects anything
-    /// without the token (so a website's cross-origin POST can't drive it).
-    private func authed(_ url: URL) -> URLRequest {
+    deinit { session.finishTasksAndInvalidate() }
+
+    private var isPinnedLoopbackOrigin: Bool {
+        base.scheme == "https" && base.host == "127.0.0.1" &&
+        base.user == nil && base.password == nil && base.port != nil &&
+        (base.path.isEmpty || base.path == "/") && base.query == nil && base.fragment == nil
+    }
+
+    private enum AuthError: LocalizedError {
+        case unverifiedBackend
+
+        var errorDescription: String? {
+            "Yap could not authenticate its local speech server."
+        }
+    }
+
+    /// Each /verify request uses pinned TLS; so does the protected request.
+    /// Even if the listener is replaced between calls, TLS authenticates the
+    /// new connection BEFORE the secret or selected text is transmitted.
+    /// Same-user malware with read access to private key is out of scope.
+    private func authed(_ url: URL) async throws -> URLRequest {
+        guard isPinnedLoopbackOrigin, let token = auth.bearerToken, await verifyAuthentic(token: token) else {
+            throw AuthError.unverifiedBackend
+        }
         var req = URLRequest(url: url)
-        if let t = BackendAuth.token { req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization") }
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         return req
     }
 
     func health() async -> HealthInfo? {
-        var req = authed(base.appending(path: "health"))
+        guard var req = try? await authed(base.appending(path: "health")) else { return nil }
         req.timeoutInterval = 2
-        guard let (data, _) = try? await session.data(for: req) else { return nil }
+        guard let (data, response) = try? await session.data(for: req),
+              (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
         return try? JSONDecoder().decode(HealthInfo.self, from: data)
     }
 
@@ -58,10 +127,13 @@ struct BackendClient {
     /// file can't produce a matching proof. /verify is auth-exempt, so this
     /// probe never leaks the token to an unverified listener.
     func verifyAuthentic() async -> Bool {
-        let nonce = Data((0..<24).map { _ in UInt8.random(in: 0...255) }).base64EncodedString()
-        // No local token → can't verify. Fail closed: don't trust a backend we
-        // can't authenticate.
-        guard let expected = BackendAuth.proof(nonce: nonce) else { return false }
+        guard isPinnedLoopbackOrigin, let token = auth.bearerToken else { return false }
+        return await verifyAuthentic(token: token)
+    }
+
+    private func verifyAuthentic(token: String) async -> Bool {
+        let nonce = UUID().uuidString
+        let expected = BackendAuth.proof(token: token, nonce: nonce)
         var url = base.appending(path: "verify")
         url.append(queryItems: [URLQueryItem(name: "nonce", value: nonce)])
         // Deliberately UNauthenticated: we're probing a backend we haven't
@@ -87,7 +159,8 @@ struct BackendClient {
         struct Resp: Decodable { let voices: [VoiceInfo] }
         var url = base.appending(path: "voices")
         url.append(queryItems: [URLQueryItem(name: "engine", value: engine)])
-        guard let (data, _) = try? await session.data(for: authed(url)),
+        guard let req = try? await authed(url),
+              let (data, _) = try? await session.data(for: req),
               let r = try? JSONDecoder().decode(Resp.self, from: data) else { return [] }
         return r.voices
     }
@@ -102,18 +175,19 @@ struct BackendClient {
     }
     func engines() async -> (kokoro: EngineInfo?, pocket: EngineInfo?) {
         struct Resp: Decodable { let kokoro: EngineInfo; let pocket: EngineInfo }
-        let req = authed(base.appending(path: "engines"))
-        guard let (data, _) = try? await session.data(for: req),
+        guard let req = try? await authed(base.appending(path: "engines")),
+              let (data, _) = try? await session.data(for: req),
               let r = try? JSONDecoder().decode(Resp.self, from: data) else { return (nil, nil) }
         return (r.kokoro, r.pocket)
     }
 
     /// Stream the Pocket-deps install, line by line, for a progress view.
     func installPocket(onLine: @escaping (String) -> Void) async throws {
-        var req = authed(base.appending(path: "engines/pocket/install"))
+        var req = try await authed(base.appending(path: "engines/pocket/install"))
         req.httpMethod = "POST"
         req.timeoutInterval = 1800
-        let (bytes, _) = try await session.bytes(for: req)
+        let (bytes, response) = try await session.bytes(for: req)
+        try await Self.requireSuccess(response, bytes: bytes)
         for try await line in bytes.lines { onLine(line) }
     }
 
@@ -121,11 +195,12 @@ struct BackendClient {
     /// failed fetch must leave the catalog voices working rather than surface as an
     /// engine error. The caller checks `cloning_installed` for the verdict.
     func installCloningWeights(onLine: @escaping (String) -> Void) async {
-        var req = authed(base.appending(path: "engines/pocket/cloning/install"))
-        req.httpMethod = "POST"
-        req.timeoutInterval = 1800
         do {
-            let (bytes, _) = try await session.bytes(for: req)
+            var req = try await authed(base.appending(path: "engines/pocket/cloning/install"))
+            req.httpMethod = "POST"
+            req.timeoutInterval = 1800
+            let (bytes, response) = try await session.bytes(for: req)
+            try await Self.requireSuccess(response, bytes: bytes)
             for try await line in bytes.lines { onLine(line) }
         } catch {
             onLine("could not fetch the cloning weights: \(error.localizedDescription)")
@@ -139,7 +214,7 @@ struct BackendClient {
     func warmPocket(voice: String) async -> Bool {
         var url = base.appending(path: "engines/pocket/warm")
         url.append(queryItems: [URLQueryItem(name: "voice", value: voice)])
-        var req = authed(url)
+        guard var req = try? await authed(url) else { return false }
         req.httpMethod = "POST"
         req.timeoutInterval = 60
         struct R: Decodable { let loaded: Bool? }
@@ -151,7 +226,7 @@ struct BackendClient {
     /// Offload an engine's model to reclaim memory (only the active engine need
     /// stay resident). No-op if already unloaded; the next read lazily reloads.
     func unloadEngine(_ name: String) async {
-        var req = authed(base.appending(path: "engines/\(name)/unload"))
+        guard var req = try? await authed(base.appending(path: "engines/\(name)/unload")) else { return }
         req.httpMethod = "POST"
         req.timeoutInterval = 15
         _ = try? await session.data(for: req)
@@ -159,18 +234,19 @@ struct BackendClient {
 
     /// Download the curated starter reference voices.
     func fetchStarterVoices(onLine: @escaping (String) -> Void) async throws {
-        var req = authed(base.appending(path: "voices/hd/starters"))
+        var req = try await authed(base.appending(path: "voices/hd/starters"))
         req.httpMethod = "POST"
         req.timeoutInterval = 300
-        let (bytes, _) = try await session.bytes(for: req)
+        let (bytes, response) = try await session.bytes(for: req)
+        try await Self.requireSuccess(response, bytes: bytes)
         for try await line in bytes.lines { onLine(line) }
     }
 
     private func synthRequest(_ text: String, voice: String, speed: Double,
-                              pauseScale: Double, engine: String, wav: Bool) -> URLRequest {
+                              pauseScale: Double, engine: String, wav: Bool) async throws -> URLRequest {
         var url = base.appending(path: "synthesize")
         if wav { url.append(queryItems: [URLQueryItem(name: "format", value: "wav")]) }
-        var req = authed(url)
+        var req = try await authed(url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let body: [String: Any] = ["text": text, "voice": voice, "speed": speed,
@@ -191,13 +267,10 @@ struct BackendClient {
                    engine: String = "kokoro",
                    awaitCapacity: (@Sendable () async -> Bool)? = nil,
                    onChunk: @escaping (Data) -> Void) async throws {
-        let req = synthRequest(text, voice: voice, speed: speed, pauseScale: pauseScale,
-                               engine: engine, wav: false)
+        let req = try await synthRequest(text, voice: voice, speed: speed, pauseScale: pauseScale,
+                                         engine: engine, wav: false)
         let (bytes, response) = try await session.bytes(for: req)
-        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-            throw NSError(domain: "Yap", code: http.statusCode,
-                          userInfo: [NSLocalizedDescriptionKey: "backend HTTP \(http.statusCode)"])
-        }
+        try await Self.requireSuccess(response, bytes: bytes)
         // Bytes the backend appends to a stream it finished. A synthesis failure
         // partway through can't change the status code (the 200 is long gone) and
         // can't abort the body either — uvicorn still terminates the chunked
@@ -249,13 +322,31 @@ struct BackendClient {
     /// Fetch a complete WAV (for export).
     func wav(text: String, voice: String, speed: Double, pauseScale: Double = 1.0,
              engine: String = "kokoro") async throws -> Data {
-        let req = synthRequest(text, voice: voice, speed: speed, pauseScale: pauseScale,
-                               engine: engine, wav: true)
+        let req = try await synthRequest(text, voice: voice, speed: speed, pauseScale: pauseScale,
+                                         engine: engine, wav: true)
         let (data, response) = try await session.data(for: req)
-        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-            throw NSError(domain: "Yap", code: http.statusCode,
-                          userInfo: [NSLocalizedDescriptionKey: "backend HTTP \(http.statusCode)"])
-        }
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        guard status == 200 else { throw Self.backendError(status: status, body: data) }
         return data
+    }
+
+    private static func requireSuccess(_ response: URLResponse, bytes: URLSession.AsyncBytes) async throws {
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        guard status != 200 else { return }
+        var body = Data()
+        for try await byte in bytes {
+            body.append(byte)
+            if body.count == 4096 { break }
+        }
+        throw backendError(status: status, body: body)
+    }
+
+    private static func backendError(status: Int, body: Data) -> NSError {
+        struct ErrorResponse: Decodable { let detail: String }
+        let pocketUnavailable = "Pocket TTS is unavailable in this evaluation build"
+        let detail = status == 503 ? (try? JSONDecoder().decode(ErrorResponse.self, from: body))?.detail : nil
+        let message = detail == pocketUnavailable ? pocketUnavailable : "backend HTTP \(status)"
+        return NSError(domain: "Yap", code: status,
+                       userInfo: [NSLocalizedDescriptionKey: message])
     }
 }

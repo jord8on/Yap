@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// One recorded passage — text Yap spoke (TTS) or text you dictated (STT).
@@ -22,22 +23,15 @@ struct HistoryEntry: Codable, Identifiable, Equatable, Sendable {
     }
 }
 
-/// Durable log of everything Yap has said and everything you've dictated, so a
-/// passage is never lost to a crash or a missed paste. Two rolling lists
-/// (newest first), JSON-backed in Application Support, capped by count.
+/// Opt-in log of spoken and dictated text. Two rolling lists (newest first),
+/// backed by plaintext JSON in Application Support and capped by count.
 ///
 /// The store is the single source of truth; the History tab reads it and can
 /// clear or delete entries. Recording is fire-and-forget from the read pipeline
 /// (`AppState.stream`) and the dictation controller.
 @MainActor
 final class HistoryStore: ObservableObject {
-    /// `YAP_HISTORY_FILE` points the store elsewhere: `--uishot` sets it so a
-    /// screenshot shows sample entries, never the user's own dictation.
-    /// `probeFileURL` does the same for `--apitest`, so a probe's reads stay out of
-    /// the History file the running app also writes. Set before first use of `shared`.
-    static var probeFileURL: URL?
-    static let shared = HistoryStore(fileURL: HistoryStore.probeFileURL
-        ?? ProcessInfo.processInfo.environment["YAP_HISTORY_FILE"].map { URL(fileURLWithPath: $0) })
+    static let shared = HistoryStore(fileURL: defaultURL, recordingEnabled: { Prefs.shared.historyEnabled })
 
     /// Max entries per list. Full text is preserved; only the count is bounded so
     /// the on-disk file can't grow without limit. `nonisolated` so the pure
@@ -46,8 +40,10 @@ final class HistoryStore: ObservableObject {
 
     @Published private(set) var spoken: [HistoryEntry] = []
     @Published private(set) var dictated: [HistoryEntry] = []
+    @Published private(set) var storageWarning: String?
 
     private let fileURL: URL
+    private let recordingEnabled: @MainActor () -> Bool
     // Both encode and write hop off the main thread (arrays are COW + Sendable, so
     // the snapshot copy is cheap and safe to hand across).
     private let io = DispatchQueue(label: "com.yap.history.io", qos: .utility)
@@ -66,10 +62,15 @@ final class HistoryStore: ObservableObject {
     private var clearedDictatedDuringLoad = false
 
     private struct Snapshot: Codable, Sendable { var spoken: [HistoryEntry]; var dictated: [HistoryEntry] }
+    private enum LoadResult: Sendable {
+        case missing
+        case loaded(Snapshot)
+        case refused
+    }
 
-    /// `fileURL` is injectable so `--selftest` can exercise a temp file.
-    init(fileURL: URL? = nil) {
-        self.fileURL = fileURL ?? Self.defaultURL
+    init(fileURL: URL, recordingEnabled: @escaping @MainActor () -> Bool) {
+        self.fileURL = fileURL
+        self.recordingEnabled = recordingEnabled
         load()
     }
 
@@ -85,6 +86,7 @@ final class HistoryStore: ObservableObject {
     func recordDictated(_ text: String, detail: String = "") { add(kind: .dictated, text: text, detail: detail) }
 
     private func add(kind: HistoryEntry.Kind, text: String, detail: String) {
+        guard recordingEnabled() else { return }
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
         let entry = HistoryEntry(kind: kind, text: t, detail: detail)
@@ -132,11 +134,18 @@ final class HistoryStore: ObservableObject {
     private func load() {
         let url = fileURL
         Task {
-            let snap = await Task.detached(priority: .userInitiated) { () -> Snapshot? in
-                guard let data = try? Data(contentsOf: url) else { return nil }
-                return try? JSONDecoder().decode(Snapshot.self, from: data)
+            let result = await Task.detached(priority: .userInitiated) { () -> LoadResult in
+                do {
+                    guard let data = try Self.readPrivateSnapshot(at: url) else { return .missing }
+                    return .loaded(try JSONDecoder().decode(Snapshot.self, from: data))
+                } catch {
+                    return .refused
+                }
             }.value
-            if let snap {
+            if case .refused = result {
+                storageWarning = "Existing history could not be safely read. It was left unchanged; new history will not be saved in this session."
+            }
+            if case .loaded(let snap) = result {
                 spoken = Self.merged(window: spoken, restored: snap.spoken,
                                      cleared: clearedSpokenDuringLoad, deleted: deletedDuringLoad)
                 dictated = Self.merged(window: dictated, restored: snap.dictated,
@@ -148,17 +157,66 @@ final class HistoryStore: ObservableObject {
         }
     }
 
+    /// Preserve legacy bytes while restricting the existing inode before reading.
+    /// Do not follow a symlink or modify a file owned by a different user.
+    nonisolated static func readPrivateSnapshot(at url: URL) throws -> Data? {
+        let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else {
+            let code = errno
+            if code == ENOENT { return nil }
+            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+        }
+        defer { close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0,
+              info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+              info.st_uid == geteuid(), info.st_nlink == 1 else {
+            throw POSIXError(.EPERM)
+        }
+        guard fchmod(fd, 0o600) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+        return try handle.readToEnd() ?? Data()
+    }
+
     private func save() {
         // Don't persist until the initial load has merged in the on-disk history,
         // or an early save would truncate the file to just the in-window entries.
         guard loaded else { pendingSave = true; return }
+        // A refused or corrupt existing file is not an empty history. Never
+        // replace it with a new snapshot after an unsuccessful initial read.
+        guard storageWarning == nil else { return }
         let spokenCopy = spoken, dictatedCopy = dictated, url = fileURL
         io.async {
             guard let data = try? JSONEncoder().encode(
                 Snapshot(spoken: spokenCopy, dictated: dictatedCopy)) else { return }
-            try? FileManager.default.createDirectory(
-                at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try? data.write(to: url, options: .atomic)
+            do {
+                try Self.writePrivateSnapshot(data, to: url)
+            } catch {
+                try? FileHandle.standardError.write(contentsOf: Data("Yap: could not save history\n".utf8))
+            }
+        }
+    }
+
+    private nonisolated static func writePrivateSnapshot(_ data: Data, to url: URL) throws {
+        let fm = FileManager.default
+        let parent = url.deletingLastPathComponent()
+        if !fm.fileExists(atPath: parent.path) {
+            try fm.createDirectory(at: parent, withIntermediateDirectories: true,
+                                   attributes: [.posixPermissions: 0o700])
+        }
+        // Stage privately beside the destination, then replace it atomically.
+        // The replacement is already 0600 when it becomes visible.
+        let staging = parent.appending(path: ".history-\(UUID().uuidString)")
+        try fm.createDirectory(at: staging, withIntermediateDirectories: false,
+                               attributes: [.posixPermissions: 0o700])
+        defer { try? fm.removeItem(at: staging) }
+        let snapshot = staging.appending(path: "snapshot.json")
+        try data.write(to: snapshot)
+        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: snapshot.path)
+        guard rename(snapshot.path, url.path) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
     }
 }

@@ -7,9 +7,14 @@ import SwiftUI
 /// start, press again to stop + insert.
 @MainActor
 final class DictationController: ObservableObject {
-    static let shared = DictationController()
+    static let shared = DictationController(prefs: .shared)
 
-    let dictation = Dictation()
+    let dictation: Dictation
+    private let prefs: Prefs
+    private let history: HistoryStore?
+    private var agentListeningAllowed: Bool {
+        prefs.agentAPIEnabled && prefs.agentListenEnabled && prefs.dictationEnabled
+    }
     @Published private(set) var targetName = ""
     @Published private(set) var targetIcon: NSImage?
 
@@ -31,15 +36,21 @@ final class DictationController: ObservableObject {
     /// Probe-only: how many delayed dismissals actually acted.
     private(set) var delayedDismissals = 0
 
+    init(prefs: Prefs, history: HistoryStore? = nil) {
+        self.prefs = prefs
+        self.history = history
+        dictation = Dictation(prefs: prefs)
+    }
+
     func bootstrap() {
-        dictation.engineChoice = Dictation.EngineChoice(rawValue: Prefs.shared.dictationEngine) ?? .english
+        dictation.engineChoice = Dictation.EngineChoice(rawValue: prefs.dictationEngine) ?? .english
         hotkey.onFire = { [weak self] in self?.toggle() }
         reapplyHotKey()   // honors dictationEnabled — won't bind the hot key when ears are off
         // Warm the model at launch (cached → fast; first ever launch downloads in
         // the background) so the first dictation isn't a cold load. Skip entirely
         // when dictation is disabled — no point downloading/loading a model the
         // user turned off.
-        if Prefs.shared.dictationEnabled {
+        if prefs.dictationEnabled {
             Task { await dictation.loadModelAwaiting(dictation.engineChoice) }
         }
     }
@@ -48,14 +59,14 @@ final class DictationController: ObservableObject {
     /// fully unbind it so it can't fire by accident. Also called after the user
     /// changes the dictation shortcut in Settings.
     func reapplyHotKey() {
-        if Prefs.shared.dictationEnabled { hotkey.register(Prefs.shared.dictationHotKey) }
+        if prefs.dictationEnabled { hotkey.register(prefs.dictationHotKey) }
         else { hotkey.unregister() }
     }
 
     /// Short start/stop cue so you know recording began/ended without watching
     /// the screen (FluidVoice does this). Uses built-in macOS sounds.
     private func playChime(start: Bool) {
-        guard !Prefs.shared.muteAllSounds, Prefs.shared.dictationChime else { return }
+        guard !prefs.muteAllSounds, prefs.dictationChime else { return }
         // Start: "Tink" cues recording. Stop: "Pop" confirms the mic has closed,
         // before transcription finishes; it cannot enter the recorded tail.
         NSSound(named: start ? "Tink" : "Pop")?.play()
@@ -107,7 +118,7 @@ final class DictationController: ObservableObject {
     private func insertDictated(_ text: String, agent: Bool = false) -> Bool {
         // Log before we try to paste — a dictation that fails to insert
         // (no Accessibility, dropped ⌘V) is exactly what History rescues.
-        HistoryStore.shared.recordDictated(text, detail: Self.historyDetail(target: targetName, agent: agent))
+        (history ?? .shared).recordDictated(text, detail: Self.historyDetail(target: targetName, agent: agent))
         if let simulatedPaste { stopTargetTracking(); simulatedPaste(text); return true }
         // Pasting fires a synthetic ⌘V, which needs Accessibility. Without
         // it the keystroke is dropped. Don't run the normal paste path then:
@@ -202,8 +213,11 @@ final class DictationController: ObservableObject {
     /// Cancelling the calling task (the client hung up, the API was switched off,
     /// listening was revoked) ends the session and DISCARDS the words.
     func listenForAgent(maxSeconds: Double, silenceSeconds: Double, insert: Bool) async -> Result<AgentListenResult, APIError> {
-        guard Prefs.shared.dictationEnabled else {
+        guard prefs.dictationEnabled else {
             return .failure(APIError(403, "dictation_disabled", "Dictation is turned off in Yap's settings."))
+        }
+        guard agentListeningAllowed else {
+            return .failure(APIError(403, "listen_disabled", "Delegated listening is turned off in Yap's settings."))
         }
         // Another listen, or the human's own dictation, owns the mic.
         if agentSession != nil || dictation.state == .listening || dictation.state == .finishing || dictation.state == .transcribing {
@@ -233,7 +247,7 @@ final class DictationController: ObservableObject {
             return .failure(APIError(503, "model_unavailable", why))
         }
         // Asked to stop (or hung up) while the model loaded: never open the mic.
-        if Task.isCancelled || session.stopReason != nil {
+        if Task.isCancelled || !agentListeningAllowed || session.stopReason != nil {
             abandon()
             return .success(AgentListenResult(text: "", reason: "stopped", seconds: 0, inserted: false))
         }
@@ -251,7 +265,7 @@ final class DictationController: ObservableObject {
         while dictation.state != .listening {
             // Stopped or hung up while the mic is still coming up (often: the prompt is
             // open). Spend the start-up token now, so an "Allow" clicked later opens nothing.
-            if Task.isCancelled || session.stopReason != nil {
+            if Task.isCancelled || !agentListeningAllowed || session.stopReason != nil {
                 dictation.cancelStart()
                 if dictation.state != .listening {
                     abandon()
@@ -282,7 +296,7 @@ final class DictationController: ObservableObject {
         var discard = false
         while true {
             try? await Task.sleep(nanoseconds: 100_000_000)
-            if Task.isCancelled || !Prefs.shared.agentListenEnabled { discard = true; break }
+            if Task.isCancelled || !agentListeningAllowed { discard = true; break }
             if let r = session.stopReason { reason = r; break }
             guard dictation.state == .listening else { reason = "stopped"; break }
             if Date().timeIntervalSince(began) >= maxSeconds || dictation.recorderFull { reason = "max_seconds"; break }
@@ -302,7 +316,7 @@ final class DictationController: ObservableObject {
         }.value
         var stopError: String?
         if case .error(let m) = dictation.state { stopError = m; dictation.clearError() }
-        if discard {
+        if discard || Task.isCancelled || !agentListeningAllowed {
             abandon()
             return .success(AgentListenResult(text: "", reason: "stopped", seconds: elapsed, inserted: false))
         }
@@ -315,7 +329,7 @@ final class DictationController: ObservableObject {
         if insert {
             pasted = insertDictated(text, agent: true)
         } else {
-            HistoryStore.shared.recordDictated(text, detail: "Agent API")
+            (history ?? .shared).recordDictated(text, detail: "Agent API")
             abandon()
         }
         return .success(AgentListenResult(text: text, reason: reason, seconds: elapsed, inserted: pasted))
